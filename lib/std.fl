@@ -1,0 +1,262 @@
+// Flint standard library: the handful of containers the compiler needs.
+// Everything here is ordinary Flint with no access to raw memory.
+
+type Option<T> = None | Some(T)
+
+// ---- growable vector ------------------------------------------------------
+
+struct Vec<T> { data: [T], len: int }
+
+fn vec_new<T>() -> Vec<T> {
+    Vec { data: array_alloc(0), len: 0 }
+}
+
+fn vec_fill<T>(n: int, x: T) -> Vec<T> {
+    Vec { data: array_new(n, x), len: n }
+}
+
+fn push<T>(v: Vec<T>, x: T) {
+    if v.len == len(v.data) {
+        vec_grow(v);
+    }
+    v.data[v.len] = x;
+    v.len = v.len + 1;
+}
+
+fn vec_grow<T>(v: Vec<T>) {
+    let cap = v.len * 2;
+    if cap < 4 { cap = 4; }
+    let bigger = array_alloc(cap);
+    for i in 0..v.len { bigger[i] = v.data[i]; }
+    v.data = bigger;
+}
+
+fn pop<T>(v: Vec<T>) -> T {
+    v.len = v.len - 1;
+    v.data[v.len]
+}
+
+fn at<T>(v: Vec<T>, i: int) -> T { v.data[i] }
+
+fn set<T>(v: Vec<T>, i: int, x: T) { v.data[i] = x; }
+
+fn last<T>(v: Vec<T>) -> T { v.data[v.len - 1] }
+
+fn vec_copy<T>(v: Vec<T>) -> Vec<T> {
+    let out = vec_new();
+    for i in 0..v.len { push(out, v.data[i]); }
+    out
+}
+
+fn vec_reverse<T>(v: Vec<T>) {
+    let i = 0;
+    let j = v.len - 1;
+    while i < j {
+        let t = v.data[i];
+        v.data[i] = v.data[j];
+        v.data[j] = t;
+        i += 1;
+        j -= 1;
+    }
+}
+
+fn index_of(v: Vec<int>, x: int) -> int {
+    for i in 0..v.len {
+        if v.data[i] == x { return i; }
+    }
+    -1
+}
+
+// Sort `items` ascending by the parallel `keys`, stably (merge sort), so equal
+// keys keep their order and the result never depends on anything but the input.
+fn sort_by_key(items: Vec<int>, keys: Vec<int>) {
+    let n = items.len;
+    let a = array_alloc(n);
+    let ka = array_alloc(n);
+    let width = 1;
+    while width < n {
+        let lo = 0;
+        while lo < n {
+            let mid = min(lo + width, n);
+            let hi = min(lo + 2 * width, n);
+            let i = lo;
+            let j = mid;
+            let k = lo;
+            while i < mid || j < hi {
+                if j >= hi || (i < mid && keys.data[i] <= keys.data[j]) {
+                    a[k] = items.data[i];
+                    ka[k] = keys.data[i];
+                    i += 1;
+                } else {
+                    a[k] = items.data[j];
+                    ka[k] = keys.data[j];
+                    j += 1;
+                }
+                k += 1;
+            }
+            lo = hi;
+        }
+        for i in 0..n {
+            items.data[i] = a[i];
+            keys.data[i] = ka[i];
+        }
+        width = width * 2;
+    }
+}
+
+fn min(a: int, b: int) -> int { if a < b { a } else { b } }
+fn max(a: int, b: int) -> int { if a > b { a } else { b } }
+
+// ---- strings --------------------------------------------------------------
+
+fn int_to_str(n: int) -> string {
+    if n == 0 { return "0"; }
+    let buf = vec_new();
+    let neg = n < 0;
+    while n != 0 {
+        let d = n % 10;
+        if d < 0 { d = 0 - d; }
+        push(buf, '0' + d);
+        n = n / 10;
+    }
+    if neg { push(buf, '-'); }
+    vec_reverse(buf);
+    str_from_array(buf.data, buf.len)
+}
+
+fn sb_add(b: Vec<int>, s: string) {
+    for i in 0..str_len(s) { push(b, char_at(s, i)); }
+}
+
+fn sb_int(b: Vec<int>, n: int) { sb_add(b, int_to_str(n)); }
+
+fn sb_str(b: Vec<int>) -> string { str_from_array(b.data, b.len) }
+
+fn cat3(a: string, b: string, c: string) -> string {
+    str_concat(a, str_concat(b, c))
+}
+
+fn println(s: string) {
+    print(s);
+    print("\n");
+}
+
+fn starts_with(s: string, prefix: string) -> bool {
+    let n = str_len(prefix);
+    if str_len(s) < n { return false; }
+    for i in 0..n {
+        if char_at(s, i) != char_at(prefix, i) { return false; }
+    }
+    true
+}
+
+// ---- string-keyed hash map (open addressing, linear probing) --------------
+
+struct Map<V> { keys: [string], vals: [V], full: [bool], cap: int, count: int }
+
+fn map_new<V>() -> Map<V> {
+    Map { keys: array_alloc(16), vals: array_alloc(16), full: array_alloc(16), cap: 16, count: 0 }
+}
+
+fn hash_str(s: string) -> int {
+    let h = 5381;
+    for i in 0..str_len(s) {
+        h = (h * 33 + char_at(s, i)) & 0x3FFFFFFF;
+    }
+    h
+}
+
+// Slot holding `k`, or the empty slot where it would go.
+fn map_slot<V>(m: Map<V>, k: string) -> int {
+    let i = hash_str(k) & (m.cap - 1);
+    while m.full[i] && m.keys[i] != k {
+        i = (i + 1) & (m.cap - 1);
+    }
+    i
+}
+
+fn map_has<V>(m: Map<V>, k: string) -> bool { m.full[map_slot(m, k)] }
+
+fn map_get<V>(m: Map<V>, k: string) -> Option<V> {
+    let i = map_slot(m, k);
+    if m.full[i] { Some(m.vals[i]) } else { None }
+}
+
+fn map_put<V>(m: Map<V>, k: string, v: V) {
+    let i = map_slot(m, k);
+    if m.full[i] {
+        m.vals[i] = v;
+        return;
+    }
+    m.keys[i] = k;
+    m.vals[i] = v;
+    m.full[i] = true;
+    m.count = m.count + 1;
+    if m.count * 2 > m.cap { map_grow(m); }
+}
+
+fn map_grow<V>(m: Map<V>) {
+    let old_keys = m.keys;
+    let old_vals = m.vals;
+    let old_full = m.full;
+    let old_cap = m.cap;
+    m.cap = old_cap * 2;
+    m.keys = array_alloc(m.cap);
+    m.vals = array_alloc(m.cap);
+    m.full = array_alloc(m.cap);
+    for i in 0..old_cap {
+        if old_full[i] {
+            let j = map_slot(m, old_keys[i]);
+            m.keys[j] = old_keys[i];
+            m.vals[j] = old_vals[i];
+            m.full[j] = true;
+        }
+    }
+}
+
+// ---- small bit sets over [int], 32 bits per word --------------------------
+
+fn bits_new(n: int) -> [int] { array_alloc((n + 31) / 32 + 1) }
+
+fn bit_get(b: [int], i: int) -> bool { (b[i >> 5] >> (i & 31)) & 1 == 1 }
+
+fn bit_set(b: [int], i: int) { b[i >> 5] = b[i >> 5] | (1 << (i & 31)); }
+
+fn bit_clear(b: [int], i: int) {
+    b[i >> 5] = b[i >> 5] & (0xFFFFFFFF ^ (1 << (i & 31)));
+}
+
+// ---- hash set of non-negative ints (open addressing) -----------------------
+
+struct IntSet { slots: [int], cap: int, count: int }
+
+fn iset_new(cap: int) -> IntSet {
+    IntSet { slots: array_new(cap, -1), cap: cap, count: 0 }
+}
+
+fn iset_slot(s: IntSet, k: int) -> int {
+    let i = ((k * 40503) ^ (k >> 9)) & (s.cap - 1);
+    while s.slots[i] >= 0 && s.slots[i] != k {
+        i = (i + 1) & (s.cap - 1);
+    }
+    i
+}
+
+fn iset_has(s: IntSet, k: int) -> bool { s.slots[iset_slot(s, k)] == k }
+
+// Insert `k`; false if it was already present.
+fn iset_add(s: IntSet, k: int) -> bool {
+    let i = iset_slot(s, k);
+    if s.slots[i] == k { return false; }
+    s.slots[i] = k;
+    s.count = s.count + 1;
+    if s.count * 2 > s.cap {
+        let old = s.slots;
+        s.cap = s.cap * 2;
+        s.slots = array_new(s.cap, -1);
+        for j in 0..len(old) {
+            if old[j] >= 0 { s.slots[iset_slot(s, old[j])] = old[j]; }
+        }
+    }
+    true
+}
