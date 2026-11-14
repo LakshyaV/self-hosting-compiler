@@ -1,0 +1,158 @@
+// Flint native runtime.
+//
+// This file is only linked into native builds; under the bootstrap seed the
+// same functions are provided by Python. It is the one place allowed to use
+// the raw-memory intrinsics (__alloc, __load*, __store*, __syscall, __cast).
+//
+// Object layout (every value is one 64-bit word):
+//   string   pointer to [length][bytes..., zero padded to 8]
+//   [T]      pointer to [length][element 0][element 1]...
+//
+// Memory comes from a bump allocator that never frees: `__alloc(n)` returns
+// the heap pointer (kept in r15) and advances it by n, which must be a
+// multiple of 8. Fresh heap pages are zero, so allocations start zeroed.
+//
+// Invariant the optimiser relies on: a string's bytes and any length word are
+// fully written before the object is handed to code outside this file.
+
+const SYS_READ = 0;
+const SYS_WRITE = 1;
+const SYS_OPEN = 2;
+const SYS_CLOSE = 3;
+const SYS_EXIT = 231;
+
+// The startup stub saves the initial stack pointer in the first heap word.
+const HEAP_BASE = 0x1000000000;
+
+fn array_alloc<T>(n: int) -> [T] {
+    let p = __alloc(8 + n * 8);
+    __store64(p, 0, n);
+    p
+}
+
+fn array_new<T>(n: int, x: T) -> [T] {
+    let p = __alloc(8 + n * 8);
+    __store64(p, 0, n);
+    for i in 0..n {
+        __store64(p, 8 + i * 8, x);
+    }
+    p
+}
+
+fn str_alloc(n: int) -> string {
+    let p = __alloc(8 + ((n + 7) & -8));
+    __store64(p, 0, n);
+    p
+}
+
+fn str_concat(a: string, b: string) -> string {
+    let na = str_len(a);
+    let nb = str_len(b);
+    let p = str_alloc(na + nb);
+    for i in 0..na { __store8(p, 8 + i, __load8(a, 8 + i)); }
+    for i in 0..nb { __store8(p, 8 + na + i, __load8(b, 8 + i)); }
+    p
+}
+
+fn substr(s: string, start: int, n: int) -> string {
+    let p = str_alloc(n);
+    for i in 0..n { __store8(p, 8 + i, __load8(s, 8 + start + i)); }
+    p
+}
+
+fn str_eq(a: string, b: string) -> bool {
+    let n = str_len(a);
+    if n != str_len(b) { return false; }
+    for i in 0..n {
+        if __load8(a, 8 + i) != __load8(b, 8 + i) { return false; }
+    }
+    true
+}
+
+fn str_from_array(a: [int], n: int) -> string {
+    let p = str_alloc(n);
+    for i in 0..n { __store8(p, 8 + i, a[i]); }
+    p
+}
+
+// Copy of `s` with a trailing NUL, for syscalls that take C strings.
+fn c_str(s: string) -> string {
+    let n = str_len(s);
+    let p = str_alloc(n + 1);
+    for i in 0..n { __store8(p, 8 + i, __load8(s, 8 + i)); }
+    p
+}
+
+fn c_ptr(s: string) -> int { __cast(s) + 8 }
+
+fn write_all(fd: int, s: string) {
+    let done = 0;
+    let n = str_len(s);
+    while done < n {
+        let r = __syscall(SYS_WRITE, fd, c_ptr(s) + done, n - done);
+        if r <= 0 { return; }
+        done = done + r;
+    }
+}
+
+fn print(s: string) { write_all(1, s); }
+
+fn eprint(s: string) { write_all(2, s); }
+
+fn exit<T>(code: int) -> T {
+    __cast(__syscall(SYS_EXIT, code, 0, 0))
+}
+
+fn read_file(path: string) -> string {
+    let fd = __syscall(SYS_OPEN, c_ptr(c_str(path)), 0, 0);
+    if fd < 0 {
+        eprint(str_concat("cannot read ", str_concat(path, "\n")));
+        exit(1);
+    }
+    // Read straight into the top of the heap, claiming space as it fills.
+    let p = __alloc(8);
+    let total = 0;
+    let more = true;
+    while more {
+        let chunk: int = __alloc(65536);
+        let r = __syscall(SYS_READ, fd, chunk, 65536);
+        if r <= 0 {
+            more = false;
+        } else {
+            // Short reads leave a gap, so slide the data down to stay contiguous.
+            if chunk != __cast(p) + 8 + total {
+                for i in 0..r { __store8(p, 8 + total + i, __load8(chunk, i)); }
+            }
+            total = total + r;
+        }
+    }
+    __syscall(SYS_CLOSE, fd, 0, 0);
+    __store64(p, 0, total);
+    p
+}
+
+fn write_file(path: string, data: string, mode: int) {
+    // O_WRONLY | O_CREAT | O_TRUNC
+    let fd = __syscall(SYS_OPEN, c_ptr(c_str(path)), 577, mode);
+    if fd < 0 {
+        eprint(str_concat("cannot write ", str_concat(path, "\n")));
+        exit(1);
+    }
+    write_all(fd, data);
+    __syscall(SYS_CLOSE, fd, 0, 0);
+}
+
+fn arg_count() -> int {
+    let sp: int = __load64(HEAP_BASE, 0);
+    __load64(sp, 0)
+}
+
+fn arg(i: int) -> string {
+    let sp: int = __load64(HEAP_BASE, 0);
+    let cs: int = __load64(sp, 8 + i * 8);
+    let n = 0;
+    while __load8(cs, n) != 0 { n = n + 1; }
+    let p = str_alloc(n);
+    for j in 0..n { __store8(p, 8 + j, __load8(cs, j)); }
+    p
+}
