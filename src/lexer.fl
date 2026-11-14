@@ -1,0 +1,149 @@
+// Lexer: source text -> tokens.
+
+const T_EOF = 0;
+const T_INT = 1;
+const T_STR = 2;
+const T_ID = 3;     // lowercase identifier
+const T_UID = 4;    // Uppercase identifier: type, constructor or constant
+const T_KW = 5;
+const T_OP = 6;
+
+// `loc` packs (file index, line) so every later phase can report positions
+// without carrying a struct around.
+struct Token { kind: int, text: string, ival: int, loc: int }
+
+struct Diag { files: Vec<string> }
+
+fn loc_str(d: Diag, loc: int) -> string {
+    cat3(at(d.files, loc >> 20), ":", int_to_str(loc & 0xFFFFF))
+}
+
+fn fatal<T>(d: Diag, loc: int, msg: string) -> T {
+    eprint(cat3(loc_str(d, loc), ": error: ", msg));
+    eprint("\n");
+    exit(1)
+}
+
+fn is_digit(c: int) -> bool { c >= '0' && c <= '9' }
+fn is_upper(c: int) -> bool { c >= 'A' && c <= 'Z' }
+fn is_alpha(c: int) -> bool { (c >= 'a' && c <= 'z') || is_upper(c) || c == '_' }
+
+fn hex_val(c: int) -> int {
+    if is_digit(c) { c - '0' }
+    else if c >= 'a' && c <= 'f' { c - 'a' + 10 }
+    else if c >= 'A' && c <= 'F' { c - 'A' + 10 }
+    else { -1 }
+}
+
+fn is_keyword(s: string) -> bool {
+    s == "fn" || s == "let" || s == "if" || s == "else" || s == "while" || s == "for"
+        || s == "in" || s == "return" || s == "break" || s == "continue" || s == "match"
+        || s == "struct" || s == "type" || s == "const" || s == "true" || s == "false"
+}
+
+struct Lexer { src: string, pos: int, line: int, file: int, diag: Diag }
+
+fn lex_loc(lx: Lexer) -> int { (lx.file << 20) | lx.line }
+
+// Decode one (possibly escaped) character of a string or char literal.
+fn lex_char(lx: Lexer) -> int {
+    let c = char_at(lx.src, lx.pos);
+    lx.pos = lx.pos + 1;
+    if c != '\\' { return c; }
+    let e = char_at(lx.src, lx.pos);
+    lx.pos = lx.pos + 1;
+    if e == 'n' { 10 }
+    else if e == 't' { 9 }
+    else if e == 'r' { 13 }
+    else if e == '0' { 0 }
+    else if e == '\\' || e == '"' || e == '\'' { e }
+    else if e == 'x' {
+        let hi = hex_val(char_at(lx.src, lx.pos));
+        let lo = hex_val(char_at(lx.src, lx.pos + 1));
+        if hi < 0 || lo < 0 { fatal(lx.diag, lex_loc(lx), "bad \\x escape"); }
+        lx.pos = lx.pos + 2;
+        hi * 16 + lo
+    }
+    else { fatal(lx.diag, lex_loc(lx), "unknown escape") }
+}
+
+// Length of the operator starting at `pos`, or 0.
+fn op_len(src: string, pos: int, n: int) -> int {
+    let c = char_at(src, pos);
+    let d = if pos + 1 < n { char_at(src, pos + 1) } else { 0 };
+    if (c == '.' && d == '.') || (c == '-' && d == '>') || (c == '=' && d == '>')
+        || (c == '=' && d == '=') || (c == '!' && d == '=') || (c == '<' && d == '=')
+        || (c == '>' && d == '=') || (c == '<' && d == '<') || (c == '>' && d == '>')
+        || (c == '&' && d == '&') || (c == '|' && d == '|') || (c == '+' && d == '=')
+        || (c == '-' && d == '=') {
+        return 2;
+    }
+    if c == '-' || c == '+' || c == '*' || c == '/' || c == '%' || c == '&' || c == '|'
+        || c == '^' || c == '!' || c == '<' || c == '>' || c == '=' || c == '(' || c == ')'
+        || c == '{' || c == '}' || c == '[' || c == ']' || c == ',' || c == ';' || c == ':'
+        || c == '.' {
+        return 1;
+    }
+    0
+}
+
+fn lex(d: Diag, src: string, file: int, out: Vec<Token>) {
+    let lx = Lexer { src: src, pos: 0, line: 1, file: file, diag: d };
+    let n = str_len(src);
+    while lx.pos < n {
+        let c = char_at(src, lx.pos);
+        let start = lx.pos;
+        let loc = lex_loc(lx);
+        if c == '\n' {
+            lx.line = lx.line + 1;
+            lx.pos = lx.pos + 1;
+        } else if c == ' ' || c == '\t' || c == '\r' {
+            lx.pos = lx.pos + 1;
+        } else if c == '/' && lx.pos + 1 < n && char_at(src, lx.pos + 1) == '/' {
+            while lx.pos < n && char_at(src, lx.pos) != '\n' { lx.pos = lx.pos + 1; }
+        } else if is_digit(c) {
+            let v = 0;
+            if c == '0' && lx.pos + 1 < n && char_at(src, lx.pos + 1) == 'x' {
+                lx.pos = lx.pos + 2;
+                while lx.pos < n && hex_val(char_at(src, lx.pos)) >= 0 {
+                    v = v * 16 + hex_val(char_at(src, lx.pos));
+                    lx.pos = lx.pos + 1;
+                }
+            } else {
+                while lx.pos < n && is_digit(char_at(src, lx.pos)) {
+                    v = v * 10 + (char_at(src, lx.pos) - '0');
+                    lx.pos = lx.pos + 1;
+                }
+            }
+            push(out, Token { kind: T_INT, text: "", ival: v, loc: loc });
+        } else if is_alpha(c) {
+            while lx.pos < n && (is_alpha(char_at(src, lx.pos)) || is_digit(char_at(src, lx.pos))) {
+                lx.pos = lx.pos + 1;
+            }
+            let text = substr(src, start, lx.pos - start);
+            let kind = if is_keyword(text) { T_KW } else if is_upper(c) { T_UID } else { T_ID };
+            push(out, Token { kind: kind, text: text, ival: 0, loc: loc });
+        } else if c == '"' {
+            lx.pos = lx.pos + 1;
+            let buf = vec_new();
+            while lx.pos < n && char_at(src, lx.pos) != '"' {
+                if char_at(src, lx.pos) == '\n' { fatal(d, loc, "unterminated string"); }
+                push(buf, lex_char(lx));
+            }
+            if lx.pos >= n { fatal(d, loc, "unterminated string"); }
+            lx.pos = lx.pos + 1;
+            push(out, Token { kind: T_STR, text: sb_str(buf), ival: 0, loc: loc });
+        } else if c == '\'' {
+            lx.pos = lx.pos + 1;
+            let v = lex_char(lx);
+            if lx.pos >= n || char_at(src, lx.pos) != '\'' { fatal(d, loc, "bad character literal"); }
+            lx.pos = lx.pos + 1;
+            push(out, Token { kind: T_INT, text: "", ival: v, loc: loc });
+        } else {
+            let k = op_len(src, lx.pos, n);
+            if k == 0 { fatal(d, loc, "unexpected character"); }
+            lx.pos = lx.pos + k;
+            push(out, Token { kind: T_OP, text: substr(src, start, k), ival: 0, loc: loc });
+        }
+    }
+}

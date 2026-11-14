@@ -1,0 +1,457 @@
+// Recursive-descent parser: tokens -> AST.
+
+struct Parser { toks: Vec<Token>, pos: int, diag: Diag, structs: Map<bool> }
+
+fn peek(p: Parser) -> Token { at(p.toks, p.pos) }
+
+fn at_tok(p: Parser, kind: int, text: string) -> bool {
+    let t = peek(p);
+    t.kind == kind && t.text == text
+}
+
+fn at_op(p: Parser, text: string) -> bool { at_tok(p, T_OP, text) }
+fn at_kw(p: Parser, text: string) -> bool { at_tok(p, T_KW, text) }
+
+fn accept_op(p: Parser, text: string) -> bool {
+    if at_op(p, text) { p.pos = p.pos + 1; true } else { false }
+}
+
+fn accept_kw(p: Parser, text: string) -> bool {
+    if at_kw(p, text) { p.pos = p.pos + 1; true } else { false }
+}
+
+fn tok_desc(t: Token) -> string {
+    if t.kind == T_EOF { "end of input" }
+    else if t.kind == T_INT { "number" }
+    else if t.kind == T_STR { "string literal" }
+    else { cat3("'", t.text, "'") }
+}
+
+fn parse_fail<T>(p: Parser, what: string) -> T {
+    let t = peek(p);
+    fatal(p.diag, t.loc, cat3(cat3("expected ", what, ", found "), tok_desc(t), ""))
+}
+
+fn expect_op(p: Parser, text: string) {
+    if !accept_op(p, text) { parse_fail(p, cat3("'", text, "'")); }
+}
+
+fn expect_kw(p: Parser, text: string) {
+    if !accept_kw(p, text) { parse_fail(p, cat3("'", text, "'")); }
+}
+
+fn expect_name(p: Parser, kind: int, what: string) -> string {
+    let t = peek(p);
+    if t.kind != kind { parse_fail(p, what); }
+    p.pos = p.pos + 1;
+    t.text
+}
+
+fn expect_id(p: Parser) -> string { expect_name(p, T_ID, "identifier") }
+fn expect_uid(p: Parser) -> string { expect_name(p, T_UID, "capitalised name") }
+
+// ---- types ----------------------------------------------------------------
+
+fn parse_type(p: Parser) -> TyExpr {
+    let loc = peek(p).loc;
+    let args = vec_new();
+    if accept_op(p, "[") {
+        push(args, parse_type(p));
+        expect_op(p, "]");
+        return TyExpr { name: "array", args: args, loc: loc };
+    }
+    if accept_kw(p, "fn") {
+        expect_op(p, "(");
+        while !at_op(p, ")") {
+            push(args, parse_type(p));
+            if !accept_op(p, ",") { break; }
+        }
+        expect_op(p, ")");
+        expect_op(p, "->");
+        push(args, parse_type(p));
+        return TyExpr { name: "fn", args: args, loc: loc };
+    }
+    if peek(p).kind == T_ID {
+        return TyExpr { name: expect_id(p), args: args, loc: loc };
+    }
+    let name = expect_uid(p);
+    if accept_op(p, "<") {
+        push(args, parse_type(p));
+        while accept_op(p, ",") { push(args, parse_type(p)); }
+        if at_op(p, ">>") {
+            // Split `>>` so that Vec<Vec<int>> closes both lists.
+            let t = peek(p);
+            set(p.toks, p.pos, Token { kind: T_OP, text: ">", ival: 0, loc: t.loc });
+        } else {
+            expect_op(p, ">");
+        }
+    }
+    TyExpr { name: name, args: args, loc: loc }
+}
+
+fn parse_tparams(p: Parser) -> Vec<string> {
+    let out = vec_new();
+    if accept_op(p, "<") {
+        push(out, expect_uid(p));
+        while accept_op(p, ",") { push(out, expect_uid(p)); }
+        expect_op(p, ">");
+    }
+    out
+}
+
+// ---- items ----------------------------------------------------------------
+
+fn parse_fn(p: Parser, loc: int) -> FnDecl {
+    let name = expect_id(p);
+    let tparams = parse_tparams(p);
+    expect_op(p, "(");
+    let params = vec_new();
+    while !at_op(p, ")") {
+        let pname = expect_id(p);
+        let ty = if accept_op(p, ":") { Some(parse_type(p)) } else { None };
+        push(params, Param { name: pname, ty: ty });
+        if !accept_op(p, ",") { break; }
+    }
+    expect_op(p, ")");
+    let ret = if accept_op(p, "->") { Some(parse_type(p)) } else { None };
+    let body = parse_block(p);
+    FnDecl { name: name, tparams: tparams, params: params, ret: ret, body: body, loc: loc }
+}
+
+fn parse_struct(p: Parser, loc: int) -> StructDecl {
+    let name = expect_uid(p);
+    let tparams = parse_tparams(p);
+    expect_op(p, "{");
+    let fields = vec_new();
+    while !at_op(p, "}") {
+        let fname = expect_id(p);
+        expect_op(p, ":");
+        push(fields, FieldDecl { name: fname, ty: parse_type(p) });
+        if !accept_op(p, ",") { break; }
+    }
+    expect_op(p, "}");
+    StructDecl { name: name, tparams: tparams, fields: fields, loc: loc }
+}
+
+fn parse_typedecl(p: Parser, loc: int) -> TypeDecl {
+    let name = expect_uid(p);
+    let tparams = parse_tparams(p);
+    expect_op(p, "=");
+    accept_op(p, "|");
+    let ctors = vec_new();
+    let more = true;
+    while more {
+        let cname = expect_uid(p);
+        let args = vec_new();
+        if accept_op(p, "(") {
+            while !at_op(p, ")") {
+                push(args, parse_type(p));
+                if !accept_op(p, ",") { break; }
+            }
+            expect_op(p, ")");
+        }
+        push(ctors, CtorDecl { name: cname, args: args });
+        more = accept_op(p, "|");
+    }
+    TypeDecl { name: name, tparams: tparams, ctors: ctors, loc: loc }
+}
+
+fn parse_program(d: Diag, toks: Vec<Token>) -> Program {
+    let p = Parser { toks: toks, pos: 0, diag: d, structs: map_new() };
+    // Struct names are needed up front: `Name {` starts a struct literal only
+    // when Name is a struct; otherwise the brace opens a block.
+    for i in 0..toks.len - 1 {
+        let t = at(toks, i);
+        if t.kind == T_KW && t.text == "struct" {
+            map_put(p.structs, at(toks, i + 1).text, true);
+        }
+    }
+    let prog = Program { fns: vec_new(), structs: vec_new(), types: vec_new(), consts: vec_new() };
+    while peek(p).kind != T_EOF {
+        let loc = peek(p).loc;
+        if accept_kw(p, "fn") {
+            push(prog.fns, parse_fn(p, loc));
+        } else if accept_kw(p, "struct") {
+            push(prog.structs, parse_struct(p, loc));
+        } else if accept_kw(p, "type") {
+            push(prog.types, parse_typedecl(p, loc));
+        } else if accept_kw(p, "const") {
+            let name = expect_uid(p);
+            expect_op(p, "=");
+            let value = parse_expr(p);
+            expect_op(p, ";");
+            push(prog.consts, ConstDecl { name: name, value: value, loc: loc });
+        } else {
+            parse_fail(p, "'fn', 'struct', 'type' or 'const'");
+        }
+    }
+    prog
+}
+
+// ---- statements -----------------------------------------------------------
+
+fn is_block_like(e: Expr) -> bool {
+    match e.k {
+        EIf(c, t, f) => true,
+        EMatch(s, arms) => true,
+        EBlock(stmts, tail) => true,
+        _ => false
+    }
+}
+
+fn parse_block(p: Parser) -> Expr {
+    let loc = peek(p).loc;
+    expect_op(p, "{");
+    let stmts = vec_new();
+    let tail = None;
+    while !at_op(p, "}") {
+        let sloc = peek(p).loc;
+        if accept_kw(p, "let") {
+            let name = expect_id(p);
+            let ty = if accept_op(p, ":") { Some(parse_type(p)) } else { None };
+            expect_op(p, "=");
+            let value = parse_expr(p);
+            expect_op(p, ";");
+            push(stmts, SLet(name, ty, value));
+        } else if accept_kw(p, "while") {
+            let cond = parse_expr(p);
+            push(stmts, SWhile(cond, parse_block(p)));
+        } else if accept_kw(p, "for") {
+            let name = expect_id(p);
+            expect_kw(p, "in");
+            let lo = parse_expr(p);
+            expect_op(p, "..");
+            let hi = parse_expr(p);
+            push(stmts, SFor(name, lo, hi, parse_block(p)));
+        } else if accept_kw(p, "return") {
+            let value = if at_op(p, ";") { None } else { Some(parse_expr(p)) };
+            expect_op(p, ";");
+            push(stmts, SReturn(value, sloc));
+        } else if accept_kw(p, "break") {
+            expect_op(p, ";");
+            push(stmts, SBreak(sloc));
+        } else if accept_kw(p, "continue") {
+            expect_op(p, ";");
+            push(stmts, SContinue(sloc));
+        } else if at_kw(p, "if") || at_kw(p, "match") || at_op(p, "{") {
+            // A block-like expression at statement start stands alone.
+            let e = parse_primary(p);
+            if at_op(p, "}") {
+                tail = Some(e);
+            } else {
+                accept_op(p, ";");
+                push(stmts, SExpr(e));
+            }
+        } else {
+            let e = parse_expr(p);
+            if accept_op(p, "=") {
+                let rhs = parse_expr(p);
+                expect_op(p, ";");
+                push(stmts, SAssign(e, rhs));
+            } else if at_op(p, "+=") || at_op(p, "-=") {
+                let op = if at_op(p, "+=") { B_ADD } else { B_SUB };
+                p.pos = p.pos + 1;
+                match e.k {
+                    EVar(n) => (),
+                    _ => fatal(p.diag, sloc, "compound assignment needs a plain variable")
+                }
+                let rhs = parse_expr(p);
+                expect_op(p, ";");
+                push(stmts, SAssign(e, mk(EBin(op, mk(e.k, e.loc), rhs), sloc)));
+            } else if accept_op(p, ";") {
+                push(stmts, SExpr(e));
+            } else if at_op(p, "}") {
+                tail = Some(e);
+            } else {
+                parse_fail(p, "';' or '}'");
+            }
+        }
+    }
+    expect_op(p, "}");
+    mk(EBlock(stmts, tail), loc)
+}
+
+// ---- expressions ----------------------------------------------------------
+
+// Operator at precedence `level` if the current token is one, else -1.
+fn binop_at(p: Parser, level: int) -> int {
+    let t = peek(p);
+    if t.kind != T_OP { return -1; }
+    let s = t.text;
+    if level == 0 { if s == "||" { return B_LOR; } }
+    else if level == 1 { if s == "&&" { return B_LAND; } }
+    else if level == 2 {
+        if s == "==" { return B_EQ; }
+        if s == "!=" { return B_NE; }
+        if s == "<" { return B_LT; }
+        if s == "<=" { return B_LE; }
+        if s == ">" { return B_GT; }
+        if s == ">=" { return B_GE; }
+    }
+    else if level == 3 { if s == "|" { return B_OR; } }
+    else if level == 4 { if s == "^" { return B_XOR; } }
+    else if level == 5 { if s == "&" { return B_AND; } }
+    else if level == 6 {
+        if s == "<<" { return B_SHL; }
+        if s == ">>" { return B_SHR; }
+    }
+    else if level == 7 {
+        if s == "+" { return B_ADD; }
+        if s == "-" { return B_SUB; }
+    }
+    else if level == 8 {
+        if s == "*" { return B_MUL; }
+        if s == "/" { return B_DIV; }
+        if s == "%" { return B_MOD; }
+    }
+    -1
+}
+
+fn parse_expr(p: Parser) -> Expr { parse_binary(p, 0) }
+
+fn parse_binary(p: Parser, level: int) -> Expr {
+    if level == 9 { return parse_unary(p); }
+    let lhs = parse_binary(p, level + 1);
+    let op = binop_at(p, level);
+    while op >= 0 {
+        let loc = peek(p).loc;
+        p.pos = p.pos + 1;
+        lhs = mk(EBin(op, lhs, parse_binary(p, level + 1)), loc);
+        op = binop_at(p, level);
+    }
+    lhs
+}
+
+fn parse_unary(p: Parser) -> Expr {
+    let loc = peek(p).loc;
+    if accept_op(p, "-") { return mk(EUn(U_NEG, parse_unary(p)), loc); }
+    if accept_op(p, "!") { return mk(EUn(U_NOT, parse_unary(p)), loc); }
+    parse_postfix(p)
+}
+
+fn parse_args(p: Parser) -> Vec<Expr> {
+    let args = vec_new();
+    while !at_op(p, ")") {
+        push(args, parse_expr(p));
+        if !accept_op(p, ",") { break; }
+    }
+    expect_op(p, ")");
+    args
+}
+
+fn parse_postfix(p: Parser) -> Expr {
+    let e = parse_primary(p);
+    while true {
+        let loc = peek(p).loc;
+        if accept_op(p, "(") {
+            e = mk(ECall(e, parse_args(p)), loc);
+        } else if accept_op(p, "[") {
+            let i = parse_expr(p);
+            expect_op(p, "]");
+            e = mk(EIndex(e, i), loc);
+        } else if accept_op(p, ".") {
+            e = mk(EField(e, expect_id(p)), loc);
+        } else {
+            return e;
+        }
+    }
+    e
+}
+
+fn parse_pattern(p: Parser) -> Pat {
+    let t = peek(p);
+    if t.kind == T_INT {
+        p.pos = p.pos + 1;
+        return PInt(t.ival);
+    }
+    if accept_op(p, "-") {
+        let n = peek(p);
+        if n.kind != T_INT { parse_fail(p, "number"); }
+        p.pos = p.pos + 1;
+        return PInt(0 - n.ival);
+    }
+    if t.kind == T_ID {
+        p.pos = p.pos + 1;
+        return if t.text == "_" { PWild } else { PVar(t.text) };
+    }
+    let name = expect_uid(p);
+    let subs = vec_new();
+    if accept_op(p, "(") {
+        while !at_op(p, ")") {
+            push(subs, expect_id(p));
+            if !accept_op(p, ",") { break; }
+        }
+        expect_op(p, ")");
+    }
+    PCtor(name, subs)
+}
+
+fn parse_primary(p: Parser) -> Expr {
+    let t = peek(p);
+    let loc = t.loc;
+    if t.kind == T_INT {
+        p.pos = p.pos + 1;
+        return mk(EInt(t.ival), loc);
+    }
+    if t.kind == T_STR {
+        p.pos = p.pos + 1;
+        return mk(EStr(t.text), loc);
+    }
+    if t.kind == T_ID {
+        p.pos = p.pos + 1;
+        return mk(EVar(t.text), loc);
+    }
+    if t.kind == T_UID {
+        p.pos = p.pos + 1;
+        if map_has(p.structs, t.text) && at_op(p, "{") {
+            expect_op(p, "{");
+            let inits = vec_new();
+            while !at_op(p, "}") {
+                let fname = expect_id(p);
+                expect_op(p, ":");
+                push(inits, FieldInit { name: fname, value: parse_expr(p) });
+                if !accept_op(p, ",") { break; }
+            }
+            expect_op(p, "}");
+            return mk(ERecord(t.text, inits), loc);
+        }
+        let args = if accept_op(p, "(") { parse_args(p) } else { vec_new() };
+        return mk(ECtor(t.text, args), loc);
+    }
+    if accept_kw(p, "true") { return mk(EBool(true), loc); }
+    if accept_kw(p, "false") { return mk(EBool(false), loc); }
+    if accept_op(p, "(") {
+        if accept_op(p, ")") { return mk(EUnit, loc); }
+        let e = parse_expr(p);
+        expect_op(p, ")");
+        return e;
+    }
+    if accept_kw(p, "if") {
+        let cond = parse_expr(p);
+        let then = parse_block(p);
+        let other = None;
+        if accept_kw(p, "else") {
+            other = Some(if at_kw(p, "if") { parse_primary(p) } else { parse_block(p) });
+        }
+        return mk(EIf(cond, then, other), loc);
+    }
+    if accept_kw(p, "match") {
+        let scrut = parse_expr(p);
+        expect_op(p, "{");
+        let arms = vec_new();
+        while !at_op(p, "}") {
+            let aloc = peek(p).loc;
+            let pat = parse_pattern(p);
+            expect_op(p, "=>");
+            let body = parse_expr(p);
+            push(arms, Arm { pat: pat, body: body, loc: aloc });
+            if !accept_op(p, ",") {
+                if !at_op(p, "}") && !is_block_like(body) { parse_fail(p, "','"); }
+            }
+        }
+        expect_op(p, "}");
+        return mk(EMatch(scrut, arms), loc);
+    }
+    if at_op(p, "{") { return parse_block(p); }
+    parse_fail(p, "expression")
+}

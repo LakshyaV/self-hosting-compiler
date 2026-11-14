@@ -1,0 +1,100 @@
+// Abstract syntax.
+
+// Type annotation as written. `name` is a type name, a type parameter, or one
+// of the built-in spellings "array" ([T]) and "fn" (args..., result).
+struct TyExpr { name: string, args: Vec<TyExpr>, loc: int }
+
+// Binary operators.
+const B_ADD = 0;
+const B_SUB = 1;
+const B_MUL = 2;
+const B_DIV = 3;
+const B_MOD = 4;
+const B_AND = 5;
+const B_OR = 6;
+const B_XOR = 7;
+const B_SHL = 8;
+const B_SHR = 9;
+const B_EQ = 10;
+const B_NE = 11;
+const B_LT = 12;
+const B_LE = 13;
+const B_GT = 14;
+const B_GE = 15;
+const B_LAND = 16;  // &&
+const B_LOR = 17;   // ||
+
+const U_NEG = 0;
+const U_NOT = 1;
+
+// `note` is a slot the type checker fills in for the lowering phase:
+//   EField  -> index of the field in its struct
+//   EBin    -> 1 when == / != compares strings
+struct Expr { k: EK, loc: int, note: int }
+
+type EK =
+    EInt(int)
+  | EStr(string)
+  | EBool(bool)
+  | EUnit
+  | EVar(string)
+  | EBin(int, Expr, Expr)
+  | EUn(int, Expr)
+  | ECall(Expr, Vec<Expr>)
+  | ECtor(string, Vec<Expr>)          // constructor application or constant
+  | ERecord(string, Vec<FieldInit>)   // struct literal
+  | EField(Expr, string)
+  | EIndex(Expr, Expr)
+  | EIf(Expr, Expr, Option<Expr>)
+  | EMatch(Expr, Vec<Arm>)
+  | EBlock(Vec<Stmt>, Option<Expr>)
+
+struct FieldInit { name: string, value: Expr }
+
+struct Arm { pat: Pat, body: Expr, loc: int }
+
+type Pat =
+    PCtor(string, Vec<string>)   // sub-patterns are binders or "_"
+  | PInt(int)
+  | PVar(string)
+  | PWild
+
+type Stmt =
+    SLet(string, Option<TyExpr>, Expr)
+  | SAssign(Expr, Expr)
+  | SWhile(Expr, Expr)
+  | SFor(string, Expr, Expr, Expr)
+  | SReturn(Option<Expr>, int)
+  | SBreak(int)
+  | SContinue(int)
+  | SExpr(Expr)
+
+struct Param { name: string, ty: Option<TyExpr> }
+
+struct FnDecl {
+    name: string,
+    tparams: Vec<string>,
+    params: Vec<Param>,
+    ret: Option<TyExpr>,
+    body: Expr,
+    loc: int
+}
+
+struct FieldDecl { name: string, ty: TyExpr }
+
+struct StructDecl { name: string, tparams: Vec<string>, fields: Vec<FieldDecl>, loc: int }
+
+struct CtorDecl { name: string, args: Vec<TyExpr> }
+
+struct TypeDecl { name: string, tparams: Vec<string>, ctors: Vec<CtorDecl>, loc: int }
+
+struct ConstDecl { name: string, value: Expr, loc: int }
+
+struct Program {
+    fns: Vec<FnDecl>,
+    structs: Vec<StructDecl>,
+    types: Vec<TypeDecl>,
+    consts: Vec<ConstDecl>
+}
+
+fn mk(k: EK, loc: int) -> Expr { Expr { k: k, loc: loc, note: 0 } }
