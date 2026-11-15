@@ -1,0 +1,576 @@
+// AST -> SSA, built directly in SSA form with the algorithm of Braun et al.,
+// "Simple and Efficient Construction of Static Single Assignment Form" (2013).
+//
+// Each source variable gets a slot. Writing a variable records the value in
+// the current block; reading one looks in the current block and otherwise
+// asks the predecessors, inserting a phi where control flow joins. A block is
+// "sealed" once all its predecessors are known; reads through an unsealed
+// block (a loop header whose back edge does not exist yet) leave an operandless
+// phi behind that is completed when the block is sealed.
+//
+// Loops are emitted rotated: `while c { body }` becomes
+//     if c { do { body } while c }
+// so the body sits in a block that dominates the loop's exit test. That gives
+// loop-invariant code motion a place to hoist to that only runs when the body
+// does.
+
+struct Lower {
+    c: Checker,
+    m: Module,
+    f: Func,
+    cur: int,
+    dead: bool,                // emitting into unreachable code
+    names: Vec<string>,        // lexical scope: names[i] lives in slot slots[i]
+    slots: Vec<int>,
+    nslots: int,
+    defs: Vec<Vec<int>>,       // per block: slot -> current value, or -1
+    sealed: Vec<bool>,
+    pending: Vec<Vec<int>>,    // per unsealed block: (slot, phi) pairs
+    breaks: Vec<int>,
+    conts: Vec<int>
+}
+
+fn lb_new(l: Lower) -> int {
+    push(l.defs, vec_new());
+    push(l.sealed, false);
+    push(l.pending, vec_new());
+    new_block(l.f)
+}
+
+fn insert_front(v: Vec<int>, x: int) {
+    push(v, x);
+    let i = v.len - 1;
+    while i > 0 {
+        v.data[i] = v.data[i - 1];
+        i -= 1;
+    }
+    v.data[0] = x;
+}
+
+fn emit(l: Lower, op: int, args: Vec<int>, imm: int) -> int {
+    let v = new_inst(l.f, op, args, imm);
+    push(at(l.f.blocks, l.cur).insts, v);
+    v
+}
+
+fn konst(l: Lower, n: int) -> int { emit(l, OP_CONST, vec_new(), n) }
+
+// A value for a variable read where none can reach: only in unreachable code.
+fn undef(l: Lower) -> int {
+    let v = new_inst(l.f, OP_CONST, vec_new(), 0);
+    insert_front(at(l.f.blocks, 0).insts, v);
+    v
+}
+
+// ---- Braun et al. -----------------------------------------------------------
+
+fn write_var(l: Lower, slot: int, blk: int, v: int) {
+    let d = at(l.defs, blk);
+    while d.len <= slot { push(d, -1); }
+    set(d, slot, v);
+}
+
+fn read_var(l: Lower, slot: int, blk: int) -> int {
+    let d = at(l.defs, blk);
+    if slot < d.len && at(d, slot) >= 0 {
+        return val(l.f, at(d, slot));
+    }
+    let b = at(l.f.blocks, blk);
+    let v = 0;
+    if !at(l.sealed, blk) {
+        // Predecessors still missing: leave a phi to be filled in on sealing.
+        v = new_inst(l.f, OP_PHI, vec_new(), 0);
+        insert_front(b.insts, v);
+        push(at(l.pending, blk), slot);
+        push(at(l.pending, blk), v);
+    } else if b.preds.len == 1 {
+        v = read_var(l, slot, at(b.preds, 0));
+    } else if b.preds.len == 0 {
+        v = undef(l);
+    } else {
+        // Write the phi before looking at predecessors so a loop finds it.
+        v = new_inst(l.f, OP_PHI, vec_new(), 0);
+        insert_front(b.insts, v);
+        write_var(l, slot, blk, v);
+        v = add_phi_operands(l, slot, blk, v);
+    }
+    write_var(l, slot, blk, v);
+    v
+}
+
+fn add_phi_operands(l: Lower, slot: int, blk: int, phi: int) -> int {
+    let b = at(l.f.blocks, blk);
+    let pi = at(l.f.insts, phi);
+    for k in 0..b.preds.len {
+        push(pi.args, read_var(l, slot, at(b.preds, k)));
+    }
+    try_remove_trivial_phi(l, phi)
+}
+
+// A phi that merges only one distinct value (besides itself) is that value.
+fn try_remove_trivial_phi(l: Lower, phi: int) -> int {
+    let pi = at(l.f.insts, phi);
+    let same = -1;
+    for k in 0..pi.args.len {
+        let a = val(l.f, at(pi.args, k));
+        if a == same || a == phi { continue; }
+        if same >= 0 { return phi; }
+        same = a;
+    }
+    if same < 0 { same = undef(l); }
+    replace(l.f, phi, same);
+    same
+}
+
+fn seal(l: Lower, blk: int) {
+    let p = at(l.pending, blk);
+    let i = 0;
+    while i < p.len {
+        add_phi_operands(l, at(p, i), blk, at(p, i + 1));
+        i += 2;
+    }
+    p.len = 0;
+    set(l.sealed, blk, true);
+}
+
+// ---- control flow -----------------------------------------------------------
+
+fn jump(l: Lower, target: int) {
+    if l.dead { return; }
+    emit(l, OP_JMP, vec_new(), target);
+    push(at(l.f.blocks, target).preds, l.cur);
+}
+
+fn branch(l: Lower, cond: int, yes: int, no: int) {
+    if l.dead { return; }
+    let v = emit(l, OP_BR, args1(cond), yes);
+    at(l.f.insts, v).aux = no;
+    push(at(l.f.blocks, yes).preds, l.cur);
+    push(at(l.f.blocks, no).preds, l.cur);
+}
+
+// Continue emitting in `b`, whose forward predecessors must all exist by now.
+fn switch_to(l: Lower, b: int) {
+    l.cur = b;
+    l.dead = b != 0 && at(l.f.blocks, b).preds.len == 0;
+}
+
+// After a return/break/continue: park in a block nothing jumps to.
+fn start_dead(l: Lower) {
+    let b = lb_new(l);
+    seal(l, b);
+    l.cur = b;
+    l.dead = true;
+}
+
+// ---- scopes -----------------------------------------------------------------
+
+fn declare(l: Lower, name: string) -> int {
+    let s = l.nslots;
+    l.nslots = l.nslots + 1;
+    push(l.names, name);
+    push(l.slots, s);
+    s
+}
+
+fn temp_slot(l: Lower) -> int {
+    l.nslots = l.nslots + 1;
+    l.nslots - 1
+}
+
+fn lookup(l: Lower, name: string) -> int {
+    let i = l.names.len - 1;
+    while i >= 0 {
+        if at(l.names, i) == name { return at(l.slots, i); }
+        i -= 1;
+    }
+    -1
+}
+
+fn close_scope(l: Lower, mark: int) {
+    l.names.len = mark;
+    l.slots.len = mark;
+}
+
+fn fn_index(l: Lower, name: string) -> int {
+    match map_get(l.c.fns, name) {
+        Some(info) => info.index,
+        None => fatal(l.c.diag, 0, cat3("internal: no function '", name, "'"))
+    }
+}
+
+// ---- expressions ------------------------------------------------------------
+
+fn lower(l: Lower, e: Expr, want: bool) -> int {
+    match e.k {
+        EInt(n) => konst(l, n),
+        EStr(s) => emit(l, OP_STR, vec_new(), intern_str(l.m, s)),
+        EBool(b) => konst(l, if b { 1 } else { 0 }),
+        EUnit => konst(l, 0),
+        EVar(name) => {
+            let s = lookup(l, name);
+            if s >= 0 { read_var(l, s, l.cur) } else { emit(l, OP_FNADDR, vec_new(), fn_index(l, name)) }
+        }
+        EBin(op, a, b) => lower_bin(l, e, op, a, b),
+        EUn(op, a) => {
+            let v = lower(l, a, true);
+            emit(l, if op == U_NEG { OP_NEG } else { OP_NOT }, args1(v), 0)
+        }
+        ECall(f, args) => lower_call(l, f, args),
+        ECtor(name, args) => lower_ctor(l, name, args),
+        ERecord(name, inits) => lower_record(l, name, inits),
+        EField(obj, fname) => {
+            let p = lower(l, obj, true);
+            emit(l, OP_LOAD, args1(p), e.note * 8)
+        }
+        EIndex(a, i) => {
+            let addr = elem_addr(l, a, i);
+            emit(l, OP_LOAD, args1(addr), 8)
+        }
+        EIf(cond, then, other) => lower_if(l, cond, then, other, want),
+        EMatch(scrut, arms) => lower_match(l, scrut, arms, want),
+        EBlock(stmts, tail) => {
+            let mark = l.names.len;
+            for i in 0..stmts.len { lower_stmt(l, at(stmts, i)); }
+            let v = match tail {
+                Some(t) => lower(l, t, want),
+                None => konst(l, 0)
+            };
+            close_scope(l, mark);
+            v
+        }
+    }
+}
+
+// Address of a[i] minus the 8-byte length header.
+fn elem_addr(l: Lower, a: Expr, i: Expr) -> int {
+    let va = lower(l, a, true);
+    let vi = lower(l, i, true);
+    let scaled = emit(l, OP_SHL, args2(vi, konst(l, 3)), 0);
+    emit(l, OP_ADD, args2(va, scaled), 0)
+}
+
+fn lower_bin(l: Lower, e: Expr, op: int, a: Expr, b: Expr) -> int {
+    if op == B_LAND || op == B_LOR {
+        // Short circuit: the result lives in a temporary slot and the SSA
+        // construction supplies the phi.
+        let res = temp_slot(l);
+        let va = lower(l, a, true);
+        write_var(l, res, l.cur, va);
+        let rhs = lb_new(l);
+        let join = lb_new(l);
+        if op == B_LAND { branch(l, va, rhs, join); } else { branch(l, va, join, rhs); }
+        seal(l, rhs);
+        switch_to(l, rhs);
+        let vb = lower(l, b, true);
+        write_var(l, res, l.cur, vb);
+        jump(l, join);
+        seal(l, join);
+        switch_to(l, join);
+        return read_var(l, res, l.cur);
+    }
+    let va = lower(l, a, true);
+    let vb = lower(l, b, true);
+    if e.note == 1 {
+        let eq = emit(l, OP_CALL, args2(va, vb), fn_index(l, "str_eq"));
+        return if op == B_EQ { eq } else { emit(l, OP_NOT, args1(eq), 0) };
+    }
+    emit(l, OP_ADD + op, args2(va, vb), 0)
+}
+
+fn lower_call(l: Lower, f: Expr, args: Vec<Expr>) -> int {
+    let direct = match f.k {
+        EVar(name) => if lookup(l, name) < 0 { name } else { "" },
+        _ => ""
+    };
+    let vals = vec_new();
+    if direct == "" { push(vals, lower(l, f, true)); }
+    for i in 0..args.len { push(vals, lower(l, at(args, i), true)); }
+    if direct == "" { return emit(l, OP_CALLIND, vals, 0); }
+    if !is_intrinsic(direct) { return emit(l, OP_CALL, vals, fn_index(l, direct)); }
+    if direct == "len" || direct == "str_len" {
+        emit(l, OP_LOADC, vals, 0)
+    } else if direct == "char_at" {
+        emit(l, OP_LOAD8C, args1(emit(l, OP_ADD, vals, 0)), 8)
+    } else if direct == "__alloc" {
+        emit(l, OP_ALLOC, vals, 0)
+    } else if direct == "__load64" {
+        emit(l, OP_LOAD, args1(emit(l, OP_ADD, vals, 0)), 0)
+    } else if direct == "__load8" {
+        emit(l, OP_LOAD8, args1(emit(l, OP_ADD, vals, 0)), 0)
+    } else if direct == "__store64" || direct == "__store8" {
+        let addr = emit(l, OP_ADD, args2(at(vals, 0), at(vals, 1)), 0);
+        emit(l, if direct == "__store64" { OP_STORE } else { OP_STORE8 }, args2(addr, at(vals, 2)), 0);
+        konst(l, 0)
+    } else if direct == "__syscall" {
+        emit(l, OP_SYSCALL, vals, 0)
+    } else {
+        at(vals, 0)     // __cast
+    }
+}
+
+fn const_int(cd: ConstDecl) -> int {
+    match cd.value.k {
+        EInt(n) => n,
+        EUn(op, a) => match a.k {
+            EInt(n) => 0 - n,
+            _ => 0
+        },
+        _ => 0
+    }
+}
+
+fn ctor_info(l: Lower, name: string) -> CtorInfo {
+    match map_get(l.c.ctors, name) {
+        Some(ci) => ci,
+        None => fatal(l.c.diag, 0, cat3("internal: no constructor '", name, "'"))
+    }
+}
+
+fn lower_ctor(l: Lower, name: string, args: Vec<Expr>) -> int {
+    match map_get(l.c.consts, name) {
+        Some(cd) => { return lower(l, cd.value, true); }
+        None => ()
+    }
+    let ci = ctor_info(l, name);
+    if !ci.boxed { return konst(l, ci.tag); }
+    let vals = vec_new();
+    for i in 0..args.len { push(vals, lower(l, at(args, i), true)); }
+    let p = emit(l, OP_ALLOC, args1(konst(l, 8 * (args.len + 1))), 0);
+    emit(l, OP_STORE, args2(p, konst(l, ci.tag)), 0);
+    for i in 0..vals.len {
+        emit(l, OP_STORE, args2(p, at(vals, i)), 8 * (i + 1));
+    }
+    p
+}
+
+fn lower_record(l: Lower, name: string, inits: Vec<FieldInit>) -> int {
+    let sd = match map_get(l.c.structs, name) {
+        Some(sd) => sd,
+        None => fatal(l.c.diag, 0, "internal: no struct")
+    };
+    let vals = vec_new();
+    for i in 0..inits.len { push(vals, lower(l, at(inits, i).value, true)); }
+    let p = emit(l, OP_ALLOC, args1(konst(l, 8 * sd.fields.len)), 0);
+    for i in 0..inits.len {
+        emit(l, OP_STORE, args2(p, at(vals, i)), 8 * field_index(sd, at(inits, i).name));
+    }
+    p
+}
+
+fn lower_if(l: Lower, cond: Expr, then: Expr, other: Option<Expr>, want: bool) -> int {
+    let vc = lower(l, cond, true);
+    let res = temp_slot(l);
+    let tb = lb_new(l);
+    let join = lb_new(l);
+    match other {
+        None => {
+            branch(l, vc, tb, join);
+            seal(l, tb);
+            switch_to(l, tb);
+            lower(l, then, false);
+            jump(l, join);
+            seal(l, join);
+            switch_to(l, join);
+            konst(l, 0)
+        }
+        Some(el) => {
+            let eb = lb_new(l);
+            branch(l, vc, tb, eb);
+            seal(l, tb);
+            seal(l, eb);
+            switch_to(l, tb);
+            let vt = lower(l, then, want);
+            if want { write_var(l, res, l.cur, vt); }
+            jump(l, join);
+            switch_to(l, eb);
+            let ve = lower(l, el, want);
+            if want { write_var(l, res, l.cur, ve); }
+            jump(l, join);
+            seal(l, join);
+            switch_to(l, join);
+            if want { read_var(l, res, l.cur) } else { konst(l, 0) }
+        }
+    }
+}
+
+fn lower_match(l: Lower, scrut: Expr, arms: Vec<Arm>, want: bool) -> int {
+    let vs = lower(l, scrut, true);
+    // Boxed data types keep their tag in the first word; enums and integers
+    // are their own tag.
+    let boxed = false;
+    for i in 0..arms.len {
+        match at(arms, i).pat {
+            PCtor(name, subs) => {
+                if !map_has(l.c.consts, name) { boxed = ctor_info(l, name).boxed; }
+            }
+            _ => ()
+        }
+    }
+    let tag = if boxed { emit(l, OP_LOADC, args1(vs), 0) } else { vs };
+    let res = temp_slot(l);
+    let join = lb_new(l);
+    for i in 0..arms.len {
+        let arm = at(arms, i);
+        let mark = l.names.len;
+        let testable = true;
+        let key = 0;
+        match arm.pat {
+            PInt(n) => { key = n; }
+            PCtor(name, subs) => {
+                key = match map_get(l.c.consts, name) {
+                    Some(cd) => const_int(cd),
+                    None => ctor_info(l, name).tag
+                };
+            }
+            _ => { testable = false; }
+        }
+        // The checker guarantees the arms are exhaustive, so the last one
+        // needs no test.
+        let next = -1;
+        if testable && i < arms.len - 1 {
+            let body = lb_new(l);
+            next = lb_new(l);
+            branch(l, emit(l, OP_EQ, args2(tag, konst(l, key)), 0), body, next);
+            seal(l, body);
+            seal(l, next);
+            switch_to(l, body);
+        }
+        match arm.pat {
+            PVar(n) => write_var(l, declare(l, n), l.cur, vs),
+            PCtor(name, subs) => {
+                for j in 0..subs.len {
+                    if at(subs, j) != "_" {
+                        let field = emit(l, OP_LOADC, args1(vs), 8 * (j + 1));
+                        write_var(l, declare(l, at(subs, j)), l.cur, field);
+                    }
+                }
+            }
+            _ => ()
+        }
+        let v = lower(l, arm.body, want);
+        if want { write_var(l, res, l.cur, v); }
+        jump(l, join);
+        close_scope(l, mark);
+        if next < 0 { break; }
+        switch_to(l, next);
+    }
+    seal(l, join);
+    switch_to(l, join);
+    if want { read_var(l, res, l.cur) } else { konst(l, 0) }
+}
+
+// ---- statements -------------------------------------------------------------
+
+fn lower_stmt(l: Lower, s: Stmt) {
+    match s {
+        SLet(name, ann, value) => {
+            let v = lower(l, value, true);
+            write_var(l, declare(l, name), l.cur, v);
+        }
+        SAssign(lhs, rhs) => {
+            match lhs.k {
+                EVar(name) => {
+                    let v = lower(l, rhs, true);
+                    write_var(l, lookup(l, name), l.cur, v);
+                }
+                EField(obj, fname) => {
+                    let p = lower(l, obj, true);
+                    let v = lower(l, rhs, true);
+                    emit(l, OP_STORE, args2(p, v), lhs.note * 8);
+                }
+                EIndex(a, i) => {
+                    let addr = elem_addr(l, a, i);
+                    let v = lower(l, rhs, true);
+                    emit(l, OP_STORE, args2(addr, v), 8);
+                }
+                _ => ()
+            }
+        }
+        SWhile(cond, body) => {
+            let head = lb_new(l);
+            let latch = lb_new(l);
+            let exit_b = lb_new(l);
+            branch(l, lower(l, cond, true), head, exit_b);
+            switch_to(l, head);
+            push(l.breaks, exit_b);
+            push(l.conts, latch);
+            lower(l, body, false);
+            pop(l.breaks);
+            pop(l.conts);
+            jump(l, latch);
+            seal(l, latch);
+            switch_to(l, latch);
+            branch(l, lower(l, cond, true), head, exit_b);
+            seal(l, head);
+            seal(l, exit_b);
+            switch_to(l, exit_b);
+        }
+        SFor(name, lo, hi, body) => {
+            let vlo = lower(l, lo, true);
+            let vhi = lower(l, hi, true);
+            let mark = l.names.len;
+            let slot = declare(l, name);
+            write_var(l, slot, l.cur, vlo);
+            let head = lb_new(l);
+            let latch = lb_new(l);
+            let exit_b = lb_new(l);
+            branch(l, emit(l, OP_LT, args2(vlo, vhi), 0), head, exit_b);
+            switch_to(l, head);
+            push(l.breaks, exit_b);
+            push(l.conts, latch);
+            lower(l, body, false);
+            pop(l.breaks);
+            pop(l.conts);
+            jump(l, latch);
+            seal(l, latch);
+            switch_to(l, latch);
+            let next = emit(l, OP_ADD, args2(read_var(l, slot, l.cur), konst(l, 1)), 0);
+            write_var(l, slot, l.cur, next);
+            branch(l, emit(l, OP_LT, args2(next, vhi), 0), head, exit_b);
+            seal(l, head);
+            seal(l, exit_b);
+            switch_to(l, exit_b);
+            close_scope(l, mark);
+        }
+        SReturn(value, loc) => {
+            let v = match value {
+                Some(e) => lower(l, e, true),
+                None => konst(l, 0)
+            };
+            if !l.dead { emit(l, OP_RET, args1(v), 0); }
+            start_dead(l);
+        }
+        SBreak(loc) => {
+            jump(l, last(l.breaks));
+            start_dead(l);
+        }
+        SContinue(loc) => {
+            jump(l, last(l.conts));
+            start_dead(l);
+        }
+        SExpr(e) => {
+            lower(l, e, false);
+        }
+    }
+}
+
+fn lower_fn(c: Checker, m: Module, info: FnInfo) -> Func {
+    let d = info.decl;
+    let f = Func { name: d.name, index: info.index, nparams: d.params.len, insts: vec_new(), blocks: vec_new() };
+    let l = Lower {
+        c: c, m: m, f: f, cur: 0, dead: false,
+        names: vec_new(), slots: vec_new(), nslots: 0,
+        defs: vec_new(), sealed: vec_new(), pending: vec_new(),
+        breaks: vec_new(), conts: vec_new()
+    };
+    let entry = lb_new(l);
+    seal(l, entry);
+    for i in 0..d.params.len {
+        let v = emit(l, OP_PARAM, vec_new(), i);
+        write_var(l, declare(l, at(d.params, i).name), entry, v);
+    }
+    let v = lower(l, d.body, true);
+    if !l.dead { emit(l, OP_RET, args1(v), 0); }
+    f
+}
