@@ -1,0 +1,426 @@
+// Control-flow graph utilities shared by the optimiser and the back end:
+// tidying, reverse postorder, dominators, natural loops, dead code removal.
+
+fn remove_at(v: Vec<int>, k: int) {
+    for i in k..v.len - 1 { v.data[i] = v.data[i + 1]; }
+    v.len = v.len - 1;
+}
+
+// Rewrite every operand through replacement chains and drop dead husks.
+fn cleanup(f: Func) {
+    for bi in 0..f.blocks.len {
+        let blk = at(f.blocks, bi);
+        let kept = vec_new();
+        for k in 0..blk.insts.len {
+            let id = at(blk.insts, k);
+            let i = at(f.insts, id);
+            if i.op == OP_NOP || i.op == OP_COPY { continue; }
+            for j in 0..i.args.len { set(i.args, j, val(f, at(i.args, j))); }
+            push(kept, id);
+        }
+        blk.insts = kept;
+    }
+}
+
+// Forget that `pred` is a predecessor of `b`, dropping the matching phi inputs.
+fn remove_pred(f: Func, b: int, pred: int) {
+    let blk = at(f.blocks, b);
+    let k = index_of(blk.preds, pred);
+    if k < 0 { return; }
+    remove_at(blk.preds, k);
+    for j in 0..blk.insts.len {
+        let i = at(f.insts, at(blk.insts, j));
+        if i.op == OP_PHI { remove_at(i.args, k); }
+    }
+}
+
+fn kill_block(f: Func, b: int) {
+    let blk = at(f.blocks, b);
+    blk.dead = true;
+    blk.insts = vec_new();
+    blk.preds = vec_new();
+}
+
+fn remove_unreachable(f: Func) {
+    let n = f.blocks.len;
+    let seen = array_new(n, false);
+    let work = vec_new();
+    let out = vec_new();
+    push(work, 0);
+    seen[0] = true;
+    while work.len > 0 {
+        let b = pop(work);
+        succs(f, b, out);
+        for k in 0..out.len {
+            let s = at(out, k);
+            if !seen[s] {
+                seen[s] = true;
+                push(work, s);
+            }
+        }
+    }
+    for b in 0..n {
+        if seen[b] || at(f.blocks, b).dead { continue; }
+        succs(f, b, out);
+        for k in 0..out.len {
+            if seen[at(out, k)] { remove_pred(f, at(out, k), b); }
+        }
+        kill_block(f, b);
+    }
+}
+
+// Phis that merge a single value are that value. Removing one can make
+// another trivial, so run to a fixed point.
+fn remove_trivial_phis(f: Func) {
+    let changed = true;
+    while changed {
+        changed = false;
+        for bi in 0..f.blocks.len {
+            let blk = at(f.blocks, bi);
+            for k in 0..blk.insts.len {
+                let id = at(blk.insts, k);
+                let i = at(f.insts, id);
+                if i.op != OP_PHI { continue; }
+                let same = -1;
+                let trivial = true;
+                for j in 0..i.args.len {
+                    let a = val(f, at(i.args, j));
+                    if a == same || a == id { continue; }
+                    if same >= 0 {
+                        trivial = false;
+                        break;
+                    }
+                    same = a;
+                }
+                if !trivial { continue; }
+                if same < 0 {
+                    // Only reachable from itself: any value will do.
+                    i.op = OP_CONST;
+                    i.args = vec_new();
+                    i.imm = 0;
+                } else {
+                    replace(f, id, same);
+                }
+                changed = true;
+            }
+        }
+    }
+}
+
+fn has_phi(f: Func, b: int) -> bool {
+    let blk = at(f.blocks, b);
+    for k in 0..blk.insts.len {
+        if at(f.insts, at(blk.insts, k)).op == OP_PHI { return true; }
+    }
+    false
+}
+
+fn replace_pred(f: Func, b: int, old: int, new: int) {
+    let preds = at(f.blocks, b).preds;
+    for k in 0..preds.len {
+        if at(preds, k) == old { set(preds, k, new); }
+    }
+}
+
+// Fold a block into its only predecessor when that predecessor falls
+// straight into it.
+fn merge_blocks(f: Func) -> bool {
+    let changed = false;
+    let out = vec_new();
+    for b in 0..f.blocks.len {
+        let blk = at(f.blocks, b);
+        if blk.dead { continue; }
+        while true {
+            let t = term(f, b);
+            if t.op != OP_JMP { break; }
+            let c = t.imm;
+            let cb = at(f.blocks, c);
+            if c == b || c == 0 || cb.preds.len != 1 { break; }
+            pop(blk.insts);
+            for k in 0..cb.insts.len {
+                let id = at(cb.insts, k);
+                let i = at(f.insts, id);
+                if i.op == OP_PHI {
+                    replace(f, id, val(f, at(i.args, 0)));
+                } else {
+                    push(blk.insts, id);
+                }
+            }
+            succs(f, b, out);
+            for k in 0..out.len { replace_pred(f, at(out, k), c, b); }
+            kill_block(f, c);
+            changed = true;
+        }
+    }
+    changed
+}
+
+// Bypass blocks that do nothing but jump on, when the destination has no phis
+// to keep in step.
+fn thread_jumps(f: Func) -> bool {
+    let changed = false;
+    for b in 1..f.blocks.len {
+        let blk = at(f.blocks, b);
+        if blk.dead || blk.insts.len != 1 { continue; }
+        let t = term(f, b);
+        if t.op != OP_JMP || t.imm == b || has_phi(f, t.imm) { continue; }
+        let target = t.imm;
+        let tpreds = at(f.blocks, target).preds;
+        remove_at(tpreds, index_of(tpreds, b));
+        for k in 0..blk.preds.len {
+            let p = at(blk.preds, k);
+            let pt = term(f, p);
+            if pt.imm == b { pt.imm = target; }
+            if pt.op == OP_BR {
+                if pt.aux == b { pt.aux = target; }
+                if pt.aux == pt.imm {
+                    pt.op = OP_JMP;
+                    pt.args = vec_new();
+                }
+            }
+            if index_of(tpreds, p) < 0 { push(tpreds, p); }
+        }
+        kill_block(f, b);
+        changed = true;
+    }
+    changed
+}
+
+// Renumber blocks so that none are dead.
+fn compact(f: Func) {
+    let n = f.blocks.len;
+    let map = array_new(n, -1);
+    let blocks = vec_new();
+    for b in 0..n {
+        if !at(f.blocks, b).dead {
+            map[b] = blocks.len;
+            push(blocks, at(f.blocks, b));
+        }
+    }
+    if blocks.len == n { return; }
+    f.blocks = blocks;
+    for b in 0..blocks.len {
+        let blk = at(blocks, b);
+        for k in 0..blk.preds.len { set(blk.preds, k, map[at(blk.preds, k)]); }
+        let t = term(f, b);
+        if t.op == OP_JMP {
+            t.imm = map[t.imm];
+        } else if t.op == OP_BR {
+            t.imm = map[t.imm];
+            t.aux = map[t.aux];
+        }
+    }
+}
+
+// Bring a function back to canonical shape: every block reachable and live,
+// no copies, no trivial phis, no needless jumps.
+fn tidy(f: Func) {
+    cleanup(f);
+    remove_unreachable(f);
+    let again = true;
+    while again {
+        remove_trivial_phis(f);
+        cleanup(f);
+        again = merge_blocks(f);
+        if thread_jumps(f) { again = true; }
+    }
+    compact(f);
+}
+
+// Remove instructions whose results are never used.
+fn dce(f: Func) {
+    let live = array_new(f.insts.len, false);
+    let work = vec_new();
+    for bi in 0..f.blocks.len {
+        let blk = at(f.blocks, bi);
+        for k in 0..blk.insts.len {
+            let id = at(blk.insts, k);
+            if has_effect(at(f.insts, id).op) {
+                live[id] = true;
+                push(work, id);
+            }
+        }
+    }
+    while work.len > 0 {
+        let i = at(f.insts, pop(work));
+        for j in 0..i.args.len {
+            let a = val(f, at(i.args, j));
+            if !live[a] {
+                live[a] = true;
+                push(work, a);
+            }
+        }
+    }
+    for bi in 0..f.blocks.len {
+        let blk = at(f.blocks, bi);
+        let kept = vec_new();
+        for k in 0..blk.insts.len {
+            if live[at(blk.insts, k)] { push(kept, at(blk.insts, k)); }
+        }
+        blk.insts = kept;
+    }
+}
+
+// ---- orderings and dominators -----------------------------------------------
+
+fn postorder_visit(f: Func, b: int, seen: [bool], out: Vec<int>) {
+    seen[b] = true;
+    let t = term(f, b);
+    // The false edge is walked first so that, reversed, the true edge's
+    // target is laid out right after its branch.
+    if t.op == OP_BR && !seen[t.aux] { postorder_visit(f, t.aux, seen, out); }
+    if (t.op == OP_BR || t.op == OP_JMP) && !seen[t.imm] { postorder_visit(f, t.imm, seen, out); }
+    push(out, b);
+}
+
+fn rpo(f: Func) -> Vec<int> {
+    let out = vec_new();
+    postorder_visit(f, 0, array_new(f.blocks.len, false), out);
+    vec_reverse(out);
+    out
+}
+
+struct Dom {
+    idom: [int],          // immediate dominator; the entry is its own
+    order: Vec<int>,      // reverse postorder
+    num: [int],           // position in `order`
+    kids: Vec<Vec<int>>,  // dominator tree children
+    tin: [int],           // entry/exit times of a walk over that tree
+    tout: [int]
+}
+
+fn dom_number(d: Dom, b: int, clock: int) -> int {
+    d.tin[b] = clock;
+    clock = clock + 1;
+    let kids = at(d.kids, b);
+    for k in 0..kids.len { clock = dom_number(d, at(kids, k), clock); }
+    d.tout[b] = clock;
+    clock + 1
+}
+
+// Cooper, Harvey & Kennedy, "A Simple, Fast Dominance Algorithm".
+fn compute_dom(f: Func) -> Dom {
+    let n = f.blocks.len;
+    let order = rpo(f);
+    let num = array_new(n, -1);
+    for i in 0..order.len { num[at(order, i)] = i; }
+    let idom = array_new(n, -1);
+    idom[0] = 0;
+    let changed = true;
+    while changed {
+        changed = false;
+        for i in 1..order.len {
+            let b = at(order, i);
+            let preds = at(f.blocks, b).preds;
+            let best = -1;
+            for k in 0..preds.len {
+                let p = at(preds, k);
+                if idom[p] < 0 { continue; }
+                if best < 0 {
+                    best = p;
+                } else {
+                    let x = p;
+                    let y = best;
+                    while x != y {
+                        while num[x] > num[y] { x = idom[x]; }
+                        while num[y] > num[x] { y = idom[y]; }
+                    }
+                    best = x;
+                }
+            }
+            if idom[b] != best {
+                idom[b] = best;
+                changed = true;
+            }
+        }
+    }
+    let kids = vec_new();
+    for b in 0..n { push(kids, vec_new()); }
+    for i in 1..order.len {
+        let b = at(order, i);
+        push(at(kids, idom[b]), b);
+    }
+    let d = Dom { idom: idom, order: order, num: num, kids: kids, tin: array_new(n, 0), tout: array_new(n, 0) };
+    dom_number(d, 0, 0);
+    d
+}
+
+fn dominates(d: Dom, a: int, b: int) -> bool {
+    d.tin[a] <= d.tin[b] && d.tout[b] <= d.tout[a]
+}
+
+// Block that defines each value.
+fn def_blocks(f: Func) -> [int] {
+    let out = array_new(f.insts.len, -1);
+    for bi in 0..f.blocks.len {
+        let blk = at(f.blocks, bi);
+        for k in 0..blk.insts.len { out[at(blk.insts, k)] = bi; }
+    }
+    out
+}
+
+// ---- natural loops ----------------------------------------------------------
+
+struct Loop { head: int, body: Vec<int>, inside: [bool] }
+
+// One loop per header, built from its back edges (edges whose target
+// dominates their source). Returned innermost first.
+fn find_loops(f: Func, d: Dom) -> Vec<Loop> {
+    let n = f.blocks.len;
+    let loops = vec_new();
+    for i in 0..d.order.len {
+        let h = at(d.order, i);
+        let preds = at(f.blocks, h).preds;
+        let inside = array_new(n, false);
+        let body = vec_new();
+        let work = vec_new();
+        for k in 0..preds.len {
+            let p = at(preds, k);
+            if dominates(d, h, p) {
+                if body.len == 0 {
+                    inside[h] = true;
+                    push(body, h);
+                }
+                if !inside[p] {
+                    inside[p] = true;
+                    push(body, p);
+                    push(work, p);
+                }
+            }
+        }
+        while work.len > 0 {
+            let b = pop(work);
+            let bp = at(f.blocks, b).preds;
+            for k in 0..bp.len {
+                let p = at(bp, k);
+                if !inside[p] {
+                    inside[p] = true;
+                    push(body, p);
+                    push(work, p);
+                }
+            }
+        }
+        if body.len > 0 { push(loops, Loop { head: h, body: body, inside: inside }); }
+    }
+    let ids = vec_new();
+    let sizes = vec_new();
+    for i in 0..loops.len {
+        push(ids, i);
+        push(sizes, at(loops, i).body.len);
+    }
+    sort_by_key(ids, sizes);
+    let sorted = vec_new();
+    for i in 0..ids.len { push(sorted, at(loops, at(ids, i))); }
+    sorted
+}
+
+// Loop nesting depth of every block.
+fn loop_depths(f: Func) -> [int] {
+    let depth = array_new(f.blocks.len, 0);
+    let loops = find_loops(f, compute_dom(f));
+    for i in 0..loops.len {
+        let body = at(loops, i).body;
+        for k in 0..body.len { depth[at(body, k)] = depth[at(body, k)] + 1; }
+    }
+    depth
+}
