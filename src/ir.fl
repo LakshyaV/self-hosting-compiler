@@ -1,0 +1,203 @@
+// SSA intermediate representation.
+//
+// A function is an arena of instructions plus a list of basic blocks. An
+// instruction is identified by its index in the arena, and that index is also
+// the name of the value it defines, so "value" and "instruction" are the same
+// thing. Blocks hold instruction indices; phis come first and the terminator
+// last. A phi's arguments are parallel to its block's predecessor list.
+//
+// Rewrites never patch users directly. Replacing a value turns its
+// instruction into OP_COPY of the replacement; `val` follows such chains and
+// `cleanup` rewrites every operand through them and drops the husks.
+
+const OP_NOP = 0;
+const OP_COPY = 1;      // args [v]
+const OP_CONST = 2;     // imm = value
+const OP_STR = 3;       // imm = string table index
+const OP_FNADDR = 4;    // imm = function index
+const OP_PARAM = 5;     // imm = parameter index
+const OP_PHI = 6;       // args parallel to block preds
+const OP_ADD = 7;       // the sixteen binary operators mirror B_ADD..B_GE
+const OP_SUB = 8;
+const OP_MUL = 9;
+const OP_DIV = 10;
+const OP_MOD = 11;
+const OP_AND = 12;
+const OP_OR = 13;
+const OP_XOR = 14;
+const OP_SHL = 15;
+const OP_SHR = 16;
+const OP_EQ = 17;
+const OP_NE = 18;
+const OP_LT = 19;
+const OP_LE = 20;
+const OP_GT = 21;
+const OP_GE = 22;
+const OP_NEG = 23;
+const OP_NOT = 24;      // boolean not
+const OP_LOAD = 25;     // args [addr], imm = displacement; 64-bit, mutable memory
+const OP_LOADC = 26;    // same, but the word is never written after initialisation
+const OP_LOAD8 = 27;    // byte load, zero extended
+const OP_LOAD8C = 28;   // byte load from immutable memory (string contents)
+const OP_STORE = 29;    // args [addr, value], imm = displacement
+const OP_STORE8 = 30;
+const OP_ALLOC = 31;    // args [size in bytes]
+const OP_CALL = 32;     // imm = function index
+const OP_CALLIND = 33;  // args [callee, args...]
+const OP_SYSCALL = 34;  // args [number, a, b, c]
+const OP_JMP = 35;      // imm = target block
+const OP_BR = 36;       // args [cond], imm = block if true, aux = block if false
+const OP_RET = 37;      // args [value]
+
+struct Inst { op: int, args: Vec<int>, imm: int, aux: int }
+
+struct Block { insts: Vec<int>, preds: Vec<int>, dead: bool }
+
+struct Func { name: string, index: int, nparams: int, insts: Vec<Inst>, blocks: Vec<Block> }
+
+struct Module { funcs: Vec<Func>, strs: Vec<string>, str_ids: Map<int> }
+
+fn new_block(f: Func) -> int {
+    push(f.blocks, Block { insts: vec_new(), preds: vec_new(), dead: false });
+    f.blocks.len - 1
+}
+
+fn new_inst(f: Func, op: int, args: Vec<int>, imm: int) -> int {
+    push(f.insts, Inst { op: op, args: args, imm: imm, aux: 0 });
+    f.insts.len - 1
+}
+
+fn args1(a: int) -> Vec<int> {
+    let v = vec_new();
+    push(v, a);
+    v
+}
+
+fn args2(a: int, b: int) -> Vec<int> {
+    let v = vec_new();
+    push(v, a);
+    push(v, b);
+    v
+}
+
+// The value `v` currently stands for, after following replacement chains.
+fn val(f: Func, v: int) -> int {
+    let i = at(f.insts, v);
+    while i.op == OP_COPY {
+        v = at(i.args, 0);
+        i = at(f.insts, v);
+    }
+    v
+}
+
+fn replace(f: Func, v: int, with: int) {
+    let i = at(f.insts, v);
+    i.op = OP_COPY;
+    i.args = args1(with);
+}
+
+fn is_term(op: int) -> bool { op >= OP_JMP }
+
+fn is_binary(op: int) -> bool { op >= OP_ADD && op <= OP_GE }
+
+fn is_commutative(op: int) -> bool {
+    op == OP_ADD || op == OP_MUL || op == OP_AND || op == OP_OR || op == OP_XOR
+        || op == OP_EQ || op == OP_NE
+}
+
+// Instructions that must stay even when their result is unused.
+fn has_effect(op: int) -> bool {
+    op == OP_STORE || op == OP_STORE8 || op == OP_CALL || op == OP_CALLIND
+        || op == OP_SYSCALL || is_term(op)
+}
+
+// Instructions whose result depends only on their operands, so two with equal
+// operands are interchangeable.
+fn is_pure(op: int) -> bool {
+    (op >= OP_CONST && op <= OP_FNADDR) || (op >= OP_ADD && op <= OP_NOT)
+        || op == OP_LOADC || op == OP_LOAD8C
+}
+
+fn term(f: Func, b: int) -> Inst {
+    at(f.insts, last(at(f.blocks, b).insts))
+}
+
+// Successors of block `b`, written into `out`.
+fn succs(f: Func, b: int, out: Vec<int>) {
+    out.len = 0;
+    let blk = at(f.blocks, b);
+    if blk.insts.len == 0 { return; }
+    let t = term(f, b);
+    if t.op == OP_JMP {
+        push(out, t.imm);
+    } else if t.op == OP_BR {
+        push(out, t.imm);
+        if t.aux != t.imm { push(out, t.aux); }
+    }
+}
+
+fn intern_str(m: Module, s: string) -> int {
+    match map_get(m.str_ids, s) {
+        Some(i) => i,
+        None => {
+            push(m.strs, s);
+            map_put(m.str_ids, s, m.strs.len - 1);
+            m.strs.len - 1
+        }
+    }
+}
+
+// ---- printing (--dump-ir) ---------------------------------------------------
+
+fn op_name(op: int) -> string {
+    if op == OP_NOP { "nop" } else if op == OP_COPY { "copy" } else if op == OP_CONST { "const" }
+    else if op == OP_STR { "str" } else if op == OP_FNADDR { "fnaddr" } else if op == OP_PARAM { "param" }
+    else if op == OP_PHI { "phi" } else if op == OP_ADD { "add" } else if op == OP_SUB { "sub" }
+    else if op == OP_MUL { "mul" } else if op == OP_DIV { "div" } else if op == OP_MOD { "mod" }
+    else if op == OP_AND { "and" } else if op == OP_OR { "or" } else if op == OP_XOR { "xor" }
+    else if op == OP_SHL { "shl" } else if op == OP_SHR { "shr" } else if op == OP_EQ { "eq" }
+    else if op == OP_NE { "ne" } else if op == OP_LT { "lt" } else if op == OP_LE { "le" }
+    else if op == OP_GT { "gt" } else if op == OP_GE { "ge" } else if op == OP_NEG { "neg" }
+    else if op == OP_NOT { "not" } else if op == OP_LOAD { "load" } else if op == OP_LOADC { "loadc" }
+    else if op == OP_LOAD8 { "load8" } else if op == OP_LOAD8C { "load8c" } else if op == OP_STORE { "store" }
+    else if op == OP_STORE8 { "store8" } else if op == OP_ALLOC { "alloc" } else if op == OP_CALL { "call" }
+    else if op == OP_CALLIND { "callind" } else if op == OP_SYSCALL { "syscall" } else if op == OP_JMP { "jmp" }
+    else if op == OP_BR { "br" } else { "ret" }
+}
+
+fn dump_func(m: Module, f: Func, b: Vec<int>) {
+    sb_add(b, cat3("fn ", f.name, cat3("/", int_to_str(f.nparams), ":\n")));
+    for bi in 0..f.blocks.len {
+        let blk = at(f.blocks, bi);
+        if blk.dead { continue; }
+        sb_add(b, cat3("  b", int_to_str(bi), ":"));
+        if blk.preds.len > 0 {
+            sb_add(b, "    ; preds");
+            for k in 0..blk.preds.len { sb_add(b, str_concat(" b", int_to_str(at(blk.preds, k)))); }
+        }
+        sb_add(b, "\n");
+        for k in 0..blk.insts.len {
+            let id = at(blk.insts, k);
+            let i = at(f.insts, id);
+            sb_add(b, "    ");
+            if !has_effect(i.op) || i.op == OP_CALL || i.op == OP_CALLIND || i.op == OP_SYSCALL {
+                sb_add(b, cat3("v", int_to_str(id), " = "));
+            }
+            sb_add(b, op_name(i.op));
+            if i.op == OP_CALL || i.op == OP_FNADDR {
+                sb_add(b, str_concat(" ", at(m.funcs, i.imm).name));
+            } else if i.op == OP_JMP {
+                sb_add(b, str_concat(" b", int_to_str(i.imm)));
+            } else if i.op == OP_CONST || i.op == OP_PARAM || i.op == OP_STR {
+                sb_add(b, str_concat(" ", int_to_str(i.imm)));
+            }
+            for j in 0..i.args.len { sb_add(b, str_concat(" v", int_to_str(at(i.args, j)))); }
+            if i.op == OP_BR {
+                sb_add(b, cat3(" b", int_to_str(i.imm), str_concat(" b", int_to_str(i.aux))));
+            } else if i.op >= OP_LOAD && i.op <= OP_STORE8 {
+                sb_add(b, str_concat(" +", int_to_str(i.imm)));
+            }
+            sb_add(b, "\n");
+        }
+    }
+}
