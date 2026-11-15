@@ -1,0 +1,868 @@
+// Hindley-Milner type inference.
+//
+// Functions are checked one strongly connected component of the call graph at
+// a time, callees first. Inside a component every function has a monomorphic
+// type; once the component is solved, whatever variables remain unbound in a
+// function's type are generalised, and each later use instantiates them
+// afresh. That is ordinary let-polymorphism with the top level as the only
+// `let`: local bindings are mutable, so they stay monomorphic.
+//
+// Annotations are optional everywhere. Declared type parameters (`fn f<T>`)
+// are rigid while the function's own body is checked.
+
+struct CtorInfo { owner: TypeDecl, tag: int, boxed: bool, args: Vec<TyExpr> }
+
+struct FnInfo { decl: FnDecl, ty: Ty, done: bool, index: int }
+
+struct Local { name: string, ty: Ty }
+
+struct EqCheck { ty: Ty, e: Expr }
+
+struct Checker {
+    diag: Diag,
+    structs: Map<StructDecl>,
+    types: Map<TypeDecl>,
+    ctors: Map<CtorInfo>,
+    consts: Map<ConstDecl>,
+    fns: Map<FnInfo>,
+    field_owners: Map<Vec<StructDecl>>,
+    next_var: int,
+    locals: Vec<Local>,
+    ret: Ty,
+    loops: int,
+    eq_checks: Vec<EqCheck>,
+    tp_names: Vec<string>,
+    tp_tys: Vec<Ty>
+}
+
+fn fresh(c: Checker) -> Ty {
+    c.next_var = c.next_var + 1;
+    TVar(TyVar { id: c.next_var, link: None })
+}
+
+fn fresh_list(c: Checker, n: int) -> Vec<Ty> {
+    let out = vec_new();
+    for i in 0..n { push(out, fresh(c)); }
+    out
+}
+
+fn unify(c: Checker, expected: Ty, found: Ty, loc: int) {
+    if !unify_types(expected, found) {
+        let vars = vec_new();
+        let want = ty_show(expected, vars);
+        fatal(c.diag, loc, cat3(cat3("type mismatch: expected ", want, ", found "), ty_show(found, vars), ""));
+    }
+}
+
+fn is_intrinsic(name: string) -> bool {
+    name == "len" || name == "str_len" || name == "char_at" || name == "__alloc"
+        || name == "__load64" || name == "__store64" || name == "__load8"
+        || name == "__store8" || name == "__syscall" || name == "__cast"
+}
+
+fn fn_type(args: Vec<Ty>, ret: Ty) -> Ty {
+    push(args, ret);
+    TCon("fn", args)
+}
+
+// Intrinsics are typed here and expanded inline by the lowering phase.
+fn intrinsic_type(c: Checker, name: string) -> Ty {
+    let a = vec_new();
+    if name == "len" {
+        push(a, t_array(fresh(c)));
+        fn_type(a, t_int())
+    } else if name == "str_len" {
+        push(a, t_str());
+        fn_type(a, t_int())
+    } else if name == "char_at" {
+        push(a, t_str());
+        push(a, t_int());
+        fn_type(a, t_int())
+    } else if name == "__alloc" {
+        push(a, t_int());
+        fn_type(a, fresh(c))
+    } else if name == "__load64" {
+        push(a, fresh(c));
+        push(a, t_int());
+        fn_type(a, fresh(c))
+    } else if name == "__store64" {
+        push(a, fresh(c));
+        push(a, t_int());
+        push(a, fresh(c));
+        fn_type(a, t_unit())
+    } else if name == "__load8" {
+        push(a, fresh(c));
+        push(a, t_int());
+        fn_type(a, t_int())
+    } else if name == "__store8" {
+        push(a, fresh(c));
+        push(a, t_int());
+        push(a, t_int());
+        fn_type(a, t_unit())
+    } else if name == "__syscall" {
+        push(a, t_int());
+        push(a, fresh(c));
+        push(a, fresh(c));
+        push(a, fresh(c));
+        fn_type(a, t_int())
+    } else {
+        push(a, fresh(c));
+        fn_type(a, fresh(c))
+    }
+}
+
+// ---- annotations -> types ---------------------------------------------------
+
+fn conv(c: Checker, te: TyExpr) -> Ty {
+    for i in 0..c.tp_names.len {
+        if at(c.tp_names, i) == te.name {
+            if te.args.len != 0 { fatal(c.diag, te.loc, "a type parameter takes no arguments"); }
+            return at(c.tp_tys, i);
+        }
+    }
+    let args = vec_new();
+    for i in 0..te.args.len { push(args, conv(c, at(te.args, i))); }
+    let n = te.name;
+    let arity = if n == "int" || n == "bool" || n == "string" || n == "unit" { 0 }
+        else if n == "array" { 1 }
+        else if n == "fn" { args.len }
+        else {
+            match map_get(c.structs, n) {
+                Some(sd) => sd.tparams.len,
+                None => match map_get(c.types, n) {
+                    Some(td) => td.tparams.len,
+                    None => fatal(c.diag, te.loc, cat3("unknown type '", n, "'"))
+                }
+            }
+        };
+    if arity != args.len {
+        fatal(c.diag, te.loc, cat3("wrong number of type arguments for '", n, "'"));
+    }
+    TCon(n, args)
+}
+
+// Convert with `names` bound to `tys` (a struct's or constructor's parameters).
+fn conv_in(c: Checker, names: Vec<string>, tys: Vec<Ty>, te: TyExpr) -> Ty {
+    let saved_names = c.tp_names;
+    let saved_tys = c.tp_tys;
+    c.tp_names = names;
+    c.tp_tys = tys;
+    let t = conv(c, te);
+    c.tp_names = saved_names;
+    c.tp_tys = saved_tys;
+    t
+}
+
+// ---- generalisation ---------------------------------------------------------
+
+struct Subst { ids: Vec<int>, id_tys: Vec<Ty>, names: Vec<string>, name_tys: Vec<Ty> }
+
+// Copy `t`, replacing each unbound variable and each rigid parameter with a
+// fresh variable (the same one for every occurrence).
+fn instantiate(c: Checker, s: Subst, t: Ty) -> Ty {
+    let t = prune(t);
+    match t {
+        TVar(v) => {
+            for i in 0..s.ids.len {
+                if at(s.ids, i) == v.id { return at(s.id_tys, i); }
+            }
+            let f = fresh(c);
+            push(s.ids, v.id);
+            push(s.id_tys, f);
+            f
+        }
+        TCon(n, args) => {
+            if is_rigid(n) {
+                for i in 0..s.names.len {
+                    if at(s.names, i) == n { return at(s.name_tys, i); }
+                }
+                let f = fresh(c);
+                push(s.names, n);
+                push(s.name_tys, f);
+                return f;
+            }
+            if args.len == 0 { return t; }
+            let out = vec_new();
+            for i in 0..args.len { push(out, instantiate(c, s, at(args, i))); }
+            TCon(n, out)
+        }
+    }
+}
+
+fn fn_use_type(c: Checker, info: FnInfo) -> Ty {
+    if !info.done { return info.ty; }
+    let s = Subst { ids: vec_new(), id_tys: vec_new(), names: vec_new(), name_tys: vec_new() };
+    instantiate(c, s, info.ty)
+}
+
+// ---- expressions ------------------------------------------------------------
+
+fn find_local(c: Checker, name: string) -> Option<Ty> {
+    let i = c.locals.len - 1;
+    while i >= 0 {
+        let l = at(c.locals, i);
+        if l.name == name { return Some(l.ty); }
+        i -= 1;
+    }
+    None
+}
+
+fn name_type(c: Checker, e: Expr, name: string, called: bool) -> Ty {
+    match find_local(c, name) {
+        Some(t) => { return t; }
+        None => ()
+    }
+    if is_intrinsic(name) {
+        if !called { fatal(c.diag, e.loc, cat3("'", name, "' is an intrinsic and can only be called")); }
+        return intrinsic_type(c, name);
+    }
+    match map_get(c.fns, name) {
+        Some(info) => fn_use_type(c, info),
+        None => fatal(c.diag, e.loc, cat3("unknown name '", name, "'"))
+    }
+}
+
+fn expect(c: Checker, e: Expr, t: Ty) {
+    unify(c, t, infer(c, e, true), e.loc);
+}
+
+fn const_type(cd: ConstDecl) -> Ty {
+    match cd.value.k {
+        EStr(s) => t_str(),
+        EBool(b) => t_bool(),
+        _ => t_int()
+    }
+}
+
+fn infer(c: Checker, e: Expr, want: bool) -> Ty {
+    match e.k {
+        EInt(n) => t_int(),
+        EStr(s) => t_str(),
+        EBool(b) => t_bool(),
+        EUnit => t_unit(),
+        EVar(name) => name_type(c, e, name, false),
+        EBin(op, a, b) => infer_bin(c, e, op, a, b),
+        EUn(op, a) => {
+            let t = if op == U_NEG { t_int() } else { t_bool() };
+            expect(c, a, t);
+            t
+        }
+        ECall(f, args) => infer_call(c, e, f, args),
+        ECtor(name, args) => infer_ctor(c, e, name, args),
+        ERecord(name, inits) => infer_record(c, e, name, inits),
+        EField(obj, fname) => infer_field(c, e, obj, fname),
+        EIndex(a, i) => {
+            let elem = fresh(c);
+            expect(c, a, t_array(elem));
+            expect(c, i, t_int());
+            elem
+        }
+        EIf(cond, then, other) => {
+            expect(c, cond, t_bool());
+            match other {
+                None => {
+                    infer(c, then, false);
+                    t_unit()
+                }
+                Some(el) => {
+                    let tt = infer(c, then, want);
+                    let te = infer(c, el, want);
+                    if want { unify(c, tt, te, el.loc); }
+                    tt
+                }
+            }
+        }
+        EMatch(scrut, arms) => infer_match(c, scrut, arms, want),
+        EBlock(stmts, tail) => infer_block(c, stmts, tail, want)
+    }
+}
+
+fn infer_bin(c: Checker, e: Expr, op: int, a: Expr, b: Expr) -> Ty {
+    if op == B_LAND || op == B_LOR {
+        expect(c, a, t_bool());
+        expect(c, b, t_bool());
+        t_bool()
+    } else if op == B_EQ || op == B_NE {
+        let ta = infer(c, a, true);
+        expect(c, b, ta);
+        // Which comparison this is depends on the final type; decided once
+        // the enclosing component has been solved.
+        push(c.eq_checks, EqCheck { ty: ta, e: e });
+        t_bool()
+    } else {
+        expect(c, a, t_int());
+        expect(c, b, t_int());
+        if op >= B_LT { t_bool() } else { t_int() }
+    }
+}
+
+fn infer_call(c: Checker, e: Expr, f: Expr, args: Vec<Expr>) -> Ty {
+    let ft = match f.k {
+        EVar(name) => name_type(c, f, name, true),
+        _ => infer(c, f, true)
+    };
+    if args.len > 6 { fatal(c.diag, e.loc, "calls take at most 6 arguments"); }
+    let arg_tys = vec_new();
+    for i in 0..args.len { push(arg_tys, infer(c, at(args, i), true)); }
+    match prune(ft) {
+        TCon(n, fa) => {
+            if n != "fn" { fatal(c.diag, e.loc, cat3("cannot call a value of type ", ty_str(ft), "")); }
+            if fa.len != args.len + 1 {
+                fatal(c.diag, e.loc, cat3(cat3("expected ", int_to_str(fa.len - 1), " argument(s), found "), int_to_str(args.len), ""));
+            }
+            for i in 0..args.len { unify(c, at(fa, i), at(arg_tys, i), at(args, i).loc); }
+            at(fa, args.len)
+        }
+        TVar(v) => {
+            let ret = fresh(c);
+            unify(c, ft, fn_type(arg_tys, ret), e.loc);
+            ret
+        }
+    }
+}
+
+fn infer_ctor(c: Checker, e: Expr, name: string, args: Vec<Expr>) -> Ty {
+    match map_get(c.consts, name) {
+        Some(cd) => {
+            if args.len != 0 { fatal(c.diag, e.loc, cat3("constant '", name, "' is not a constructor")); }
+            return const_type(cd);
+        }
+        None => ()
+    }
+    let ci = match map_get(c.ctors, name) {
+        Some(ci) => ci,
+        None => fatal(c.diag, e.loc, cat3("unknown constructor '", name, "'"))
+    };
+    if args.len != ci.args.len {
+        fatal(c.diag, e.loc, cat3(cat3("constructor '", name, "' takes "), int_to_str(ci.args.len), " argument(s)"));
+    }
+    let targs = fresh_list(c, ci.owner.tparams.len);
+    for i in 0..args.len {
+        let want_ty = conv_in(c, ci.owner.tparams, targs, at(ci.args, i));
+        unify(c, want_ty, infer(c, at(args, i), true), at(args, i).loc);
+    }
+    TCon(ci.owner.name, targs)
+}
+
+fn field_index(sd: StructDecl, fname: string) -> int {
+    for i in 0..sd.fields.len {
+        if at(sd.fields, i).name == fname { return i; }
+    }
+    -1
+}
+
+fn infer_record(c: Checker, e: Expr, name: string, inits: Vec<FieldInit>) -> Ty {
+    let sd = match map_get(c.structs, name) {
+        Some(sd) => sd,
+        None => fatal(c.diag, e.loc, cat3("unknown struct '", name, "'"))
+    };
+    let targs = fresh_list(c, sd.tparams.len);
+    let seen = array_new(sd.fields.len, false);
+    for i in 0..inits.len {
+        let init = at(inits, i);
+        let idx = field_index(sd, init.name);
+        if idx < 0 { fatal(c.diag, init.value.loc, cat3(cat3("struct '", name, "' has no field '"), init.name, "'")); }
+        if seen[idx] { fatal(c.diag, init.value.loc, cat3("field '", init.name, "' given twice")); }
+        seen[idx] = true;
+        let want_ty = conv_in(c, sd.tparams, targs, at(sd.fields, idx).ty);
+        unify(c, want_ty, infer(c, init.value, true), init.value.loc);
+    }
+    for i in 0..sd.fields.len {
+        if !seen[i] { fatal(c.diag, e.loc, cat3("missing field '", at(sd.fields, i).name, "'")); }
+    }
+    TCon(name, targs)
+}
+
+fn infer_field(c: Checker, e: Expr, obj: Expr, fname: string) -> Ty {
+    let t = prune(infer(c, obj, true));
+    let sd = match t {
+        TCon(n, args) => match map_get(c.structs, n) {
+            Some(sd) => sd,
+            None => fatal(c.diag, e.loc, cat3(cat3("type ", ty_str(t), " has no field '"), fname, "'"))
+        },
+        TVar(v) => match map_get(c.field_owners, fname) {
+            // The record type is not known yet: fall back to the field name,
+            // which settles it when only one struct declares that field.
+            Some(owners) => {
+                if owners.len != 1 {
+                    fatal(c.diag, e.loc, cat3("cannot tell which struct '.", fname, "' belongs to here; add a type annotation"));
+                }
+                at(owners, 0)
+            }
+            None => fatal(c.diag, e.loc, cat3("no struct has a field '", fname, "'"))
+        }
+    };
+    let idx = field_index(sd, fname);
+    if idx < 0 { fatal(c.diag, e.loc, cat3(cat3("struct '", sd.name, "' has no field '"), fname, "'")); }
+    let targs = fresh_list(c, sd.tparams.len);
+    unify(c, TCon(sd.name, targs), t, e.loc);
+    e.note = idx;
+    conv_in(c, sd.tparams, targs, at(sd.fields, idx).ty)
+}
+
+fn infer_match(c: Checker, scrut: Expr, arms: Vec<Arm>, want: bool) -> Ty {
+    let st = infer(c, scrut, true);
+    let res = fresh(c);
+    let covered: Vec<string> = vec_new();
+    let nctors = -1;
+    let total = false;
+    for i in 0..arms.len {
+        let arm = at(arms, i);
+        let mark = c.locals.len;
+        if total { fatal(c.diag, arm.loc, "unreachable match arm"); }
+        match arm.pat {
+            PWild => { total = true; }
+            PVar(n) => {
+                total = true;
+                push(c.locals, Local { name: n, ty: st });
+            }
+            PInt(n) => unify(c, t_int(), st, arm.loc),
+            PCtor(name, subs) => {
+                match map_get(c.consts, name) {
+                    Some(cd) => {
+                        if subs.len != 0 { fatal(c.diag, arm.loc, "a constant pattern takes no arguments"); }
+                        unify(c, t_int(), const_type(cd), arm.loc);
+                        unify(c, t_int(), st, arm.loc);
+                    }
+                    None => {
+                        let ci = match map_get(c.ctors, name) {
+                            Some(ci) => ci,
+                            None => fatal(c.diag, arm.loc, cat3("unknown constructor '", name, "'"))
+                        };
+                        if subs.len != ci.args.len {
+                            fatal(c.diag, arm.loc, cat3(cat3("constructor '", name, "' has "), int_to_str(ci.args.len), " field(s)"));
+                        }
+                        let targs = fresh_list(c, ci.owner.tparams.len);
+                        unify(c, TCon(ci.owner.name, targs), st, arm.loc);
+                        for j in 0..subs.len {
+                            if at(subs, j) != "_" {
+                                let ft = conv_in(c, ci.owner.tparams, targs, at(ci.args, j));
+                                push(c.locals, Local { name: at(subs, j), ty: ft });
+                            }
+                        }
+                        for j in 0..covered.len {
+                            if at(covered, j) == name { fatal(c.diag, arm.loc, cat3("constructor '", name, "' is matched twice")); }
+                        }
+                        push(covered, name);
+                        nctors = ci.owner.ctors.len;
+                    }
+                }
+            }
+        }
+        let bt = infer(c, arm.body, want);
+        if want { unify(c, res, bt, arm.body.loc); }
+        c.locals.len = mark;
+    }
+    if !total && covered.len != nctors {
+        fatal(c.diag, scrut.loc, "match is not exhaustive; add the missing constructors or a '_' arm");
+    }
+    if want { res } else { t_unit() }
+}
+
+fn diverges(s: Stmt) -> bool {
+    match s {
+        SReturn(v, loc) => true,
+        SBreak(loc) => true,
+        SContinue(loc) => true,
+        _ => false
+    }
+}
+
+fn infer_block(c: Checker, stmts: Vec<Stmt>, tail: Option<Expr>, want: bool) -> Ty {
+    let mark = c.locals.len;
+    for i in 0..stmts.len { infer_stmt(c, at(stmts, i)); }
+    let t = match tail {
+        Some(e) => infer(c, e, want),
+        None => if stmts.len > 0 && diverges(last(stmts)) { fresh(c) } else { t_unit() }
+    };
+    c.locals.len = mark;
+    t
+}
+
+fn infer_stmt(c: Checker, s: Stmt) {
+    match s {
+        SLet(name, ann, value) => {
+            let t = infer(c, value, true);
+            match ann {
+                Some(te) => unify(c, conv(c, te), t, value.loc),
+                None => ()
+            }
+            push(c.locals, Local { name: name, ty: t });
+        }
+        SAssign(lhs, rhs) => {
+            match lhs.k {
+                EVar(name) => match find_local(c, name) {
+                    Some(t) => (),
+                    None => fatal(c.diag, lhs.loc, cat3("cannot assign to '", name, "'"))
+                },
+                EField(obj, fname) => (),
+                EIndex(a, i) => (),
+                _ => fatal(c.diag, lhs.loc, "cannot assign to this expression")
+            }
+            let tl = infer(c, lhs, true);
+            expect(c, rhs, tl);
+        }
+        SWhile(cond, body) => {
+            expect(c, cond, t_bool());
+            c.loops = c.loops + 1;
+            infer(c, body, false);
+            c.loops = c.loops - 1;
+        }
+        SFor(name, lo, hi, body) => {
+            expect(c, lo, t_int());
+            expect(c, hi, t_int());
+            push(c.locals, Local { name: name, ty: t_int() });
+            c.loops = c.loops + 1;
+            infer(c, body, false);
+            c.loops = c.loops - 1;
+            c.locals.len = c.locals.len - 1;
+        }
+        SReturn(value, loc) => {
+            match value {
+                Some(v) => expect(c, v, c.ret),
+                None => unify(c, c.ret, t_unit(), loc)
+            }
+        }
+        SBreak(loc) => {
+            if c.loops == 0 { fatal(c.diag, loc, "'break' outside a loop"); }
+        }
+        SContinue(loc) => {
+            if c.loops == 0 { fatal(c.diag, loc, "'continue' outside a loop"); }
+        }
+        SExpr(e) => {
+            infer(c, e, false);
+        }
+    }
+}
+
+// ---- call graph and its strongly connected components -----------------------
+
+fn refs_stmt(c: Checker, s: Stmt, out: Vec<int>) {
+    match s {
+        SLet(name, ann, value) => refs_expr(c, value, out),
+        SAssign(lhs, rhs) => {
+            refs_expr(c, lhs, out);
+            refs_expr(c, rhs, out);
+        }
+        SWhile(cond, body) => {
+            refs_expr(c, cond, out);
+            refs_expr(c, body, out);
+        }
+        SFor(name, lo, hi, body) => {
+            refs_expr(c, lo, out);
+            refs_expr(c, hi, out);
+            refs_expr(c, body, out);
+        }
+        SReturn(value, loc) => match value {
+            Some(v) => refs_expr(c, v, out),
+            None => ()
+        },
+        SExpr(e) => refs_expr(c, e, out),
+        _ => ()
+    }
+}
+
+// Collect the functions `e` mentions. Shadowing is ignored, which can only
+// make components coarser, never wrong.
+fn refs_expr(c: Checker, e: Expr, out: Vec<int>) {
+    match e.k {
+        EVar(name) => match map_get(c.fns, name) {
+            Some(info) => push(out, info.index),
+            None => ()
+        },
+        EBin(op, a, b) => {
+            refs_expr(c, a, out);
+            refs_expr(c, b, out);
+        }
+        EUn(op, a) => refs_expr(c, a, out),
+        ECall(f, args) => {
+            refs_expr(c, f, out);
+            for i in 0..args.len { refs_expr(c, at(args, i), out); }
+        }
+        ECtor(name, args) => {
+            for i in 0..args.len { refs_expr(c, at(args, i), out); }
+        }
+        ERecord(name, inits) => {
+            for i in 0..inits.len { refs_expr(c, at(inits, i).value, out); }
+        }
+        EField(obj, fname) => refs_expr(c, obj, out),
+        EIndex(a, i) => {
+            refs_expr(c, a, out);
+            refs_expr(c, i, out);
+        }
+        EIf(cond, then, other) => {
+            refs_expr(c, cond, out);
+            refs_expr(c, then, out);
+            match other {
+                Some(el) => refs_expr(c, el, out),
+                None => ()
+            }
+        }
+        EMatch(scrut, arms) => {
+            refs_expr(c, scrut, out);
+            for i in 0..arms.len { refs_expr(c, at(arms, i).body, out); }
+        }
+        EBlock(stmts, tail) => {
+            for i in 0..stmts.len { refs_stmt(c, at(stmts, i), out); }
+            match tail {
+                Some(t) => refs_expr(c, t, out),
+                None => ()
+            }
+        }
+        _ => ()
+    }
+}
+
+struct Tarjan {
+    adj: Vec<Vec<int>>,
+    index: [int],
+    low: [int],
+    on_stack: [bool],
+    stack: Vec<int>,
+    next: int,
+    sccs: Vec<Vec<int>>
+}
+
+// Tarjan's algorithm. Components come out callees-first.
+fn strongconnect(t: Tarjan, v: int) {
+    t.index[v] = t.next;
+    t.low[v] = t.next;
+    t.next = t.next + 1;
+    push(t.stack, v);
+    t.on_stack[v] = true;
+    let edges = at(t.adj, v);
+    for i in 0..edges.len {
+        let w = at(edges, i);
+        if t.index[w] < 0 {
+            strongconnect(t, w);
+            t.low[v] = min(t.low[v], t.low[w]);
+        } else if t.on_stack[w] {
+            t.low[v] = min(t.low[v], t.index[w]);
+        }
+    }
+    if t.low[v] == t.index[v] {
+        let comp = vec_new();
+        let more = true;
+        while more {
+            let w = pop(t.stack);
+            t.on_stack[w] = false;
+            push(comp, w);
+            more = w != v;
+        }
+        push(t.sccs, comp);
+    }
+}
+
+fn sccs_of(adj: Vec<Vec<int>>) -> Vec<Vec<int>> {
+    let n = adj.len;
+    let t = Tarjan {
+        adj: adj,
+        index: array_new(n, -1),
+        low: array_new(n, 0),
+        on_stack: array_new(n, false),
+        stack: vec_new(),
+        next: 0,
+        sccs: vec_new()
+    };
+    for v in 0..n {
+        if t.index[v] < 0 { strongconnect(t, v); }
+    }
+    t.sccs
+}
+
+// ---- declarations -----------------------------------------------------------
+
+fn rigid_params(d: FnDecl) -> Vec<Ty> {
+    let out = vec_new();
+    for i in 0..d.tparams.len {
+        push(out, t_con0(cat3(cat3("'", at(d.tparams, i), "/"), d.name, "")));
+    }
+    out
+}
+
+// Give a function its starting type: annotations where present, fresh
+// variables everywhere else.
+fn declare_fn(c: Checker, info: FnInfo) {
+    let d = info.decl;
+    c.tp_names = d.tparams;
+    c.tp_tys = rigid_params(d);
+    let sig = vec_new();
+    for i in 0..d.params.len {
+        match at(d.params, i).ty {
+            Some(te) => push(sig, conv(c, te)),
+            None => push(sig, fresh(c))
+        }
+    }
+    let ret = match d.ret {
+        Some(te) => conv(c, te),
+        None => fresh(c)
+    };
+    info.ty = fn_type(sig, ret);
+}
+
+fn check_fn(c: Checker, info: FnInfo) {
+    let d = info.decl;
+    c.tp_names = d.tparams;
+    c.tp_tys = rigid_params(d);
+    let sig = match info.ty {
+        TCon(n, args) => args,
+        TVar(v) => vec_new()
+    };
+    c.locals = vec_new();
+    for i in 0..d.params.len {
+        push(c.locals, Local { name: at(d.params, i).name, ty: at(sig, i) });
+    }
+    c.ret = last(sig);
+    c.loops = 0;
+    let t = infer(c, d.body, true);
+    unify(c, c.ret, t, d.loc);
+}
+
+// Settle every == / != seen in the component now that its types are final.
+fn resolve_eq_checks(c: Checker) {
+    for i in 0..c.eq_checks.len {
+        let chk = at(c.eq_checks, i);
+        match prune(chk.ty) {
+            TVar(v) => unify(c, t_int(), chk.ty, chk.e.loc),
+            TCon(n, args) => {
+                // Words compare directly for scalars and for enums whose
+                // constructors carry no data; strings compare by content.
+                let plain_enum = match map_get(c.types, n) {
+                    Some(td) => !type_is_boxed(td),
+                    None => false
+                };
+                if n == "string" {
+                    chk.e.note = 1;
+                } else if !(n == "int" || n == "bool" || n == "unit" || plain_enum) {
+                    fatal(c.diag, chk.e.loc, cat3("values of type ", ty_str(chk.ty), " cannot be compared with == or !="));
+                }
+            }
+        }
+    }
+    c.eq_checks = vec_new();
+}
+
+fn type_is_boxed(td: TypeDecl) -> bool {
+    for i in 0..td.ctors.len {
+        if at(td.ctors, i).args.len > 0 { return true; }
+    }
+    false
+}
+
+fn check_const(c: Checker, cd: ConstDecl) {
+    let ok = match cd.value.k {
+        EInt(n) => true,
+        EStr(s) => true,
+        EBool(b) => true,
+        EUn(op, a) => match a.k {
+            EInt(n) => op == U_NEG,
+            _ => false
+        },
+        _ => false
+    };
+    if !ok { fatal(c.diag, cd.loc, "a constant must be a literal"); }
+}
+
+fn check_program(d: Diag, prog: Program) -> Checker {
+    let c = Checker {
+        diag: d,
+        structs: map_new(),
+        types: map_new(),
+        ctors: map_new(),
+        consts: map_new(),
+        fns: map_new(),
+        field_owners: map_new(),
+        next_var: 0,
+        locals: vec_new(),
+        ret: t_unit(),
+        loops: 0,
+        eq_checks: vec_new(),
+        tp_names: vec_new(),
+        tp_tys: vec_new()
+    };
+    for i in 0..prog.structs.len {
+        let sd = at(prog.structs, i);
+        if map_has(c.structs, sd.name) { fatal(d, sd.loc, cat3("struct '", sd.name, "' is defined twice")); }
+        map_put(c.structs, sd.name, sd);
+        for j in 0..sd.fields.len {
+            let fname = at(sd.fields, j).name;
+            match map_get(c.field_owners, fname) {
+                Some(owners) => push(owners, sd),
+                None => {
+                    let owners = vec_new();
+                    push(owners, sd);
+                    map_put(c.field_owners, fname, owners);
+                }
+            }
+        }
+    }
+    for i in 0..prog.types.len {
+        let td = at(prog.types, i);
+        if map_has(c.types, td.name) || map_has(c.structs, td.name) {
+            fatal(d, td.loc, cat3("type '", td.name, "' is defined twice"));
+        }
+        map_put(c.types, td.name, td);
+        let boxed = type_is_boxed(td);
+        for j in 0..td.ctors.len {
+            let cd = at(td.ctors, j);
+            if map_has(c.ctors, cd.name) { fatal(d, td.loc, cat3("constructor '", cd.name, "' is defined twice")); }
+            map_put(c.ctors, cd.name, CtorInfo { owner: td, tag: j, boxed: boxed, args: cd.args });
+        }
+    }
+    for i in 0..prog.consts.len {
+        let cd = at(prog.consts, i);
+        check_const(c, cd);
+        if map_has(c.consts, cd.name) || map_has(c.ctors, cd.name) {
+            fatal(d, cd.loc, cat3("'", cd.name, "' is defined twice"));
+        }
+        map_put(c.consts, cd.name, cd);
+    }
+    // Field and constructor argument types must themselves be well formed.
+    for i in 0..prog.structs.len {
+        let sd = at(prog.structs, i);
+        let targs = fresh_list(c, sd.tparams.len);
+        for j in 0..sd.fields.len { conv_in(c, sd.tparams, targs, at(sd.fields, j).ty); }
+    }
+    for i in 0..prog.types.len {
+        let td = at(prog.types, i);
+        let targs = fresh_list(c, td.tparams.len);
+        for j in 0..td.ctors.len {
+            let cd = at(td.ctors, j);
+            for k in 0..cd.args.len { conv_in(c, td.tparams, targs, at(cd.args, k)); }
+        }
+    }
+    let infos = vec_new();
+    for i in 0..prog.fns.len {
+        let fd = at(prog.fns, i);
+        if map_has(c.fns, fd.name) { fatal(d, fd.loc, cat3("function '", fd.name, "' is defined twice")); }
+        if is_intrinsic(fd.name) { fatal(d, fd.loc, cat3("'", fd.name, "' is a built-in and cannot be redefined")); }
+        if fd.params.len > 6 { fatal(d, fd.loc, "functions take at most 6 parameters"); }
+        let info = FnInfo { decl: fd, ty: t_unit(), done: false, index: i };
+        map_put(c.fns, fd.name, info);
+        push(infos, info);
+    }
+    let adj = vec_new();
+    for i in 0..infos.len {
+        let out = vec_new();
+        refs_expr(c, at(infos, i).decl.body, out);
+        push(adj, out);
+    }
+    let sccs = sccs_of(adj);
+    for i in 0..sccs.len {
+        let comp = at(sccs, i);
+        for j in 0..comp.len { declare_fn(c, at(infos, at(comp, j))); }
+        for j in 0..comp.len { check_fn(c, at(infos, at(comp, j))); }
+        resolve_eq_checks(c);
+        for j in 0..comp.len { at(infos, at(comp, j)).done = true; }
+    }
+    match map_get(c.fns, "main") {
+        Some(info) => {
+            if info.decl.params.len != 0 { fatal(d, info.decl.loc, "main takes no parameters"); }
+        }
+        None => {
+            eprint("error: no 'main' function\n");
+            exit(1);
+        }
+    }
+    c
+}

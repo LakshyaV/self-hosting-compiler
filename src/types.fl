@@ -1,0 +1,141 @@
+// Types and unification for Hindley-Milner inference.
+//
+// A type is either an inference variable or a constructor applied to
+// arguments. Variables are mutable cells: unification binds a variable by
+// writing its `link`, and `prune` chases (and compresses) those links.
+//
+//   int, bool, string, unit      TCon(name, [])
+//   [T]                          TCon("array", [T])
+//   fn(A, B) -> R                TCon("fn", [A, B, R])
+//   Vec<T>, Option<T>, ...       TCon(name, [T])
+//   rigid type parameter T       TCon("'T/owner", [])
+
+type Ty = TVar(TyVar) | TCon(string, Vec<Ty>)
+
+struct TyVar { id: int, link: Option<Ty> }
+
+fn prune(t: Ty) -> Ty {
+    match t {
+        TVar(v) => match v.link {
+            Some(u) => {
+                let r = prune(u);
+                v.link = Some(r);
+                r
+            }
+            None => t
+        },
+        TCon(n, args) => t
+    }
+}
+
+fn t_con0(name: string) -> Ty { TCon(name, vec_new()) }
+fn t_int() -> Ty { t_con0("int") }
+fn t_bool() -> Ty { t_con0("bool") }
+fn t_str() -> Ty { t_con0("string") }
+fn t_unit() -> Ty { t_con0("unit") }
+
+fn t_array(elem: Ty) -> Ty {
+    let args = vec_new();
+    push(args, elem);
+    TCon("array", args)
+}
+
+fn is_rigid(name: string) -> bool { char_at(name, 0) == '\'' }
+
+fn occurs(v: TyVar, t: Ty) -> bool {
+    match prune(t) {
+        TVar(w) => v.id == w.id,
+        TCon(n, args) => {
+            for i in 0..args.len {
+                if occurs(v, at(args, i)) { return true; }
+            }
+            false
+        }
+    }
+}
+
+// Make `a` and `b` equal, or report that they cannot be.
+fn unify_types(a: Ty, b: Ty) -> bool {
+    let a = prune(a);
+    let b = prune(b);
+    match a {
+        TVar(va) => {
+            match b {
+                TVar(vb) => { if va.id == vb.id { return true; } }
+                TCon(nb, ab) => ()
+            }
+            if occurs(va, b) { return false; }
+            va.link = Some(b);
+            true
+        }
+        TCon(na, aa) => match b {
+            TVar(vb) => {
+                if occurs(vb, a) { return false; }
+                vb.link = Some(a);
+                true
+            }
+            TCon(nb, ab) => {
+                if na != nb || aa.len != ab.len { return false; }
+                for i in 0..aa.len {
+                    if !unify_types(at(aa, i), at(ab, i)) { return false; }
+                }
+                true
+            }
+        }
+    }
+}
+
+fn ty_list_str(b: Vec<int>, args: Vec<Ty>, n: int, vars: Vec<int>) {
+    for i in 0..n {
+        if i > 0 { sb_add(b, ", "); }
+        sb_add(b, ty_show(at(args, i), vars));
+    }
+}
+
+// Render a type for a diagnostic. Unsolved variables print as 'a, 'b, ... in
+// order of first appearance; `vars` carries that order across the types of
+// one message so the same variable gets the same letter in each.
+fn ty_show(t: Ty, vars: Vec<int>) -> string {
+    match prune(t) {
+        TVar(v) => {
+            let k = index_of(vars, v.id);
+            if k < 0 {
+                push(vars, v.id);
+                k = vars.len - 1;
+            }
+            let b = vec_new();
+            push(b, '\'');
+            push(b, 'a' + k % 26);
+            if k >= 26 { sb_int(b, k / 26); }
+            sb_str(b)
+        }
+        TCon(n, args) => {
+            let b = vec_new();
+            if n == "array" {
+                sb_add(b, "[");
+                sb_add(b, ty_show(at(args, 0), vars));
+                sb_add(b, "]");
+            } else if n == "fn" {
+                sb_add(b, "fn(");
+                ty_list_str(b, args, args.len - 1, vars);
+                sb_add(b, ") -> ");
+                sb_add(b, ty_show(last(args), vars));
+            } else if is_rigid(n) {
+                // 'T/owner prints as T
+                let stop = 1;
+                while char_at(n, stop) != '/' { stop += 1; }
+                sb_add(b, substr(n, 1, stop - 1));
+            } else {
+                sb_add(b, n);
+                if args.len > 0 {
+                    sb_add(b, "<");
+                    ty_list_str(b, args, args.len, vars);
+                    sb_add(b, ">");
+                }
+            }
+            sb_str(b)
+        }
+    }
+}
+
+fn ty_str(t: Ty) -> string { ty_show(t, vec_new()) }
