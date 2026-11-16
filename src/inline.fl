@@ -1,0 +1,146 @@
+// Function inlining.
+//
+// The call graph is walked bottom-up, so by the time a function is examined
+// its callees are final and already contain whatever was inlined into them.
+// A callee that is still being visited is part of a recursive cycle and is
+// left alone. Small callees are copied into the caller: the call's block is
+// split in two, the callee's blocks are cloned in between, parameters become
+// the argument values and each return becomes a jump to the second half,
+// where a phi collects the result.
+
+const INLINE_LIMIT = 30;        // largest callee, in instructions
+const INLINE_CALLER_MAX = 6000; // stop growing a caller beyond this
+
+struct Inliner { m: Module, state: [int], size: [int] }
+
+fn func_size(f: Func) -> int {
+    let n = 0;
+    for b in 0..f.blocks.len {
+        let blk = at(f.blocks, b);
+        for k in 0..blk.insts.len {
+            let op = at(f.insts, at(blk.insts, k)).op;
+            if op != OP_CONST && op != OP_PARAM { n += 1; }
+        }
+    }
+    n
+}
+
+// Replace the call at position `k` of block `b` with the body of `g`.
+// Returns the block holding the code that followed the call.
+fn inline_call(f: Func, b: int, k: int, g: Func) -> int {
+    let blk = at(f.blocks, b);
+    let call_id = at(blk.insts, k);
+    let call = at(f.insts, call_id);
+    let tail = new_block(f);
+    let tb = at(f.blocks, tail);
+    for j in k + 1..blk.insts.len { push(tb.insts, at(blk.insts, j)); }
+    blk.insts.len = k;
+    let out = vec_new();
+    succs(f, tail, out);
+    for j in 0..out.len { replace_pred(f, at(out, j), b, tail); }
+
+    let bmap = array_new(g.blocks.len, -1);
+    for gb in 0..g.blocks.len { bmap[gb] = new_block(f); }
+    let vmap = array_new(g.insts.len, -1);
+    for gb in 0..g.blocks.len {
+        let src = at(g.blocks, gb);
+        for j in 0..src.insts.len {
+            let id = at(src.insts, j);
+            let gi = at(g.insts, id);
+            if gi.op == OP_PARAM {
+                vmap[id] = at(call.args, gi.imm);
+            } else {
+                vmap[id] = new_inst(f, gi.op, vec_new(), gi.imm);
+            }
+        }
+    }
+    let results = vec_new();
+    for gb in 0..g.blocks.len {
+        let src = at(g.blocks, gb);
+        let dst = at(f.blocks, bmap[gb]);
+        for j in 0..src.preds.len { push(dst.preds, bmap[at(src.preds, j)]); }
+        for j in 0..src.insts.len {
+            let id = at(src.insts, j);
+            let gi = at(g.insts, id);
+            if gi.op == OP_PARAM { continue; }
+            let ni = at(f.insts, vmap[id]);
+            for a in 0..gi.args.len { push(ni.args, vmap[at(gi.args, a)]); }
+            if gi.op == OP_JMP {
+                ni.imm = bmap[gi.imm];
+            } else if gi.op == OP_BR {
+                ni.imm = bmap[gi.imm];
+                ni.aux = bmap[gi.aux];
+            } else if gi.op == OP_RET {
+                push(results, at(ni.args, 0));
+                ni.op = OP_JMP;
+                ni.args = vec_new();
+                ni.imm = tail;
+                push(tb.preds, bmap[gb]);
+            }
+            push(dst.insts, vmap[id]);
+        }
+    }
+    push(blk.insts, new_inst(f, OP_JMP, vec_new(), bmap[0]));
+    push(at(f.blocks, bmap[0]).preds, b);
+    // The call instruction lives on as the value of the inlined body.
+    if results.len == 1 {
+        call.op = OP_COPY;
+        call.args = args1(at(results, 0));
+    } else {
+        call.op = if results.len == 0 { OP_CONST } else { OP_PHI };
+        call.args = results;
+        call.imm = 0;
+        insert_front(tb.insts, call_id);
+    }
+    tail
+}
+
+fn inline_into(inl: Inliner, f: Func) {
+    let work = vec_new();
+    for b in 0..f.blocks.len { push(work, b); }
+    let w = 0;
+    while w < work.len {
+        let b = at(work, w);
+        let blk = at(f.blocks, b);
+        let k = 0;
+        while k < blk.insts.len {
+            let i = at(f.insts, at(blk.insts, k));
+            if i.op == OP_CALL && i.imm != f.index && inl.state[i.imm] == 2
+                && inl.size[i.imm] <= INLINE_LIMIT && f.insts.len < INLINE_CALLER_MAX {
+                // Whatever followed the call is now in a new block; carry on there.
+                push(work, inline_call(f, b, k, at(inl.m.funcs, i.imm)));
+                break;
+            }
+            k += 1;
+        }
+        w += 1;
+    }
+}
+
+fn inline_visit(inl: Inliner, fi: int) {
+    inl.state[fi] = 1;
+    let f = at(inl.m.funcs, fi);
+    let callees = vec_new();
+    for b in 0..f.blocks.len {
+        let blk = at(f.blocks, b);
+        for k in 0..blk.insts.len {
+            let i = at(f.insts, at(blk.insts, k));
+            if i.op == OP_CALL { push(callees, i.imm); }
+        }
+    }
+    for k in 0..callees.len {
+        if inl.state[at(callees, k)] == 0 { inline_visit(inl, at(callees, k)); }
+    }
+    inline_into(inl, f);
+    tidy(f);
+    inl.size[fi] = func_size(f);
+    inl.state[fi] = 2;
+}
+
+fn inline_module(m: Module) {
+    let n = m.funcs.len;
+    let inl = Inliner { m: m, state: array_new(n, 0), size: array_new(n, 0) };
+    for fi in 0..n {
+        if inl.state[fi] == 0 { inline_visit(inl, fi); }
+    }
+}
