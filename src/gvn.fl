@@ -1,0 +1,213 @@
+// Global value numbering over the dominator tree, with peephole
+// simplification on the way.
+//
+// Blocks are visited in dominator-tree preorder with a scoped hash table of
+// the pure expressions seen so far. An instruction that computes something
+// already in the table is redundant: the earlier one dominates it, so every
+// use can be redirected there. Leaving a block removes what it added, so
+// expressions never leak between sibling subtrees.
+
+struct Gvn {
+    f: Func,
+    d: Dom,
+    heads: [int],      // bucket -> most recent instruction, or -1
+    next: [int],       // instruction -> previous one in its bucket
+    nbuckets: int,
+    trail: Vec<int>    // buckets pushed to, for undoing on scope exit
+}
+
+fn const_of(f: Func, v: int) -> Option<int> {
+    let i = at(f.insts, v);
+    if i.op == OP_CONST { Some(i.imm) } else { None }
+}
+
+fn is_const(f: Func, v: int, c: int) -> bool {
+    let i = at(f.insts, v);
+    i.op == OP_CONST && i.imm == c
+}
+
+fn make_const(i: Inst, c: int) {
+    i.op = OP_CONST;
+    i.args = vec_new();
+    i.imm = c;
+}
+
+fn inverse_cmp(op: int) -> int {
+    if op == OP_EQ { OP_NE } else if op == OP_NE { OP_EQ } else if op == OP_LT { OP_GE }
+    else if op == OP_GE { OP_LT } else if op == OP_GT { OP_LE } else { OP_GT }
+}
+
+// Algebraic identities. Either rewrites `id` in place or replaces it with an
+// existing value; returns true in the second case.
+fn simplify(f: Func, id: int) -> bool {
+    let i = at(f.insts, id);
+    let op = i.op;
+    if op >= OP_LOAD && op <= OP_STORE8 {
+        // Fold a constant offset into the displacement.
+        let addr = at(f.insts, at(i.args, 0));
+        if addr.op == OP_ADD {
+            let x = at(addr.args, 0);
+            let y = at(addr.args, 1);
+            let cx = at(f.insts, x);
+            let cy = at(f.insts, y);
+            if cy.op == OP_CONST && fits_i32(i.imm + cy.imm) {
+                set(i.args, 0, x);
+                i.imm = i.imm + cy.imm;
+            } else if cx.op == OP_CONST && fits_i32(i.imm + cx.imm) {
+                set(i.args, 0, y);
+                i.imm = i.imm + cx.imm;
+            }
+        }
+        return false;
+    }
+    if op == OP_NOT {
+        let x = at(f.insts, at(i.args, 0));
+        if x.op == OP_NOT {
+            replace(f, id, at(x.args, 0));
+            return true;
+        }
+        if x.op >= OP_EQ && x.op <= OP_GE {
+            i.op = inverse_cmp(x.op);
+            i.args = args2(at(x.args, 0), at(x.args, 1));
+        } else if x.op == OP_CONST {
+            make_const(i, 1 - x.imm);
+        }
+        return false;
+    }
+    if op == OP_NEG {
+        let x = at(f.insts, at(i.args, 0));
+        if x.op == OP_CONST { make_const(i, 0 - x.imm); }
+        return false;
+    }
+    if !is_binary(op) { return false; }
+    let a = at(i.args, 0);
+    let b = at(i.args, 1);
+    let ia = at(f.insts, a);
+    let ib = at(f.insts, b);
+    if ia.op == OP_CONST && ib.op == OP_CONST {
+        if can_fold(op, ia.imm, ib.imm) { make_const(i, fold(op, ia.imm, ib.imm)); }
+        return false;
+    }
+    if a == b {
+        if op == OP_SUB || op == OP_XOR || op == OP_NE || op == OP_LT || op == OP_GT {
+            make_const(i, 0);
+            return false;
+        }
+        if op == OP_EQ || op == OP_LE || op == OP_GE {
+            make_const(i, 1);
+            return false;
+        }
+        if op == OP_AND || op == OP_OR {
+            replace(f, id, a);
+            return true;
+        }
+    }
+    let zero_b = is_const(f, b, 0);
+    let zero_a = is_const(f, a, 0);
+    if zero_b && (op == OP_ADD || op == OP_SUB || op == OP_OR || op == OP_XOR || op == OP_SHL || op == OP_SHR) {
+        replace(f, id, a);
+        return true;
+    }
+    if zero_a && (op == OP_ADD || op == OP_OR || op == OP_XOR) {
+        replace(f, id, b);
+        return true;
+    }
+    if (zero_a || zero_b) && (op == OP_MUL || op == OP_AND) {
+        make_const(i, 0);
+        return false;
+    }
+    if op == OP_MUL {
+        if is_const(f, b, 1) {
+            replace(f, id, a);
+            return true;
+        }
+        if is_const(f, a, 1) {
+            replace(f, id, b);
+            return true;
+        }
+    }
+    false
+}
+
+fn gvn_hash(g: Gvn, i: Inst) -> int {
+    let h = i.op * 31 + (i.imm & 0xFFFFF);
+    for k in 0..i.args.len { h = (h * 33 + at(i.args, k)) & 0x3FFFFFFF; }
+    (h & 0x3FFFFFFF) % g.nbuckets
+}
+
+fn same_expr(a: Inst, b: Inst) -> bool {
+    if a.op != b.op || a.imm != b.imm || a.args.len != b.args.len { return false; }
+    for k in 0..a.args.len {
+        if at(a.args, k) != at(b.args, k) { return false; }
+    }
+    true
+}
+
+fn gvn_block(g: Gvn, b: int) {
+    let f = g.f;
+    let mark = g.trail.len;
+    let blk = at(f.blocks, b);
+    for k in 0..blk.insts.len {
+        let id = at(blk.insts, k);
+        let i = at(f.insts, id);
+        if i.op == OP_PHI { continue; }
+        for j in 0..i.args.len { set(i.args, j, val(f, at(i.args, j))); }
+        if i.op == OP_BR {
+            // Branching on !x is branching on x the other way round.
+            let c = at(f.insts, at(i.args, 0));
+            if c.op == OP_NOT {
+                set(i.args, 0, at(c.args, 0));
+                let t = i.imm;
+                i.imm = i.aux;
+                i.aux = t;
+            }
+            continue;
+        }
+        if simplify(f, id) { continue; }
+        if !is_pure(i.op) { continue; }
+        if is_commutative(i.op) && at(i.args, 0) > at(i.args, 1) {
+            let t = at(i.args, 0);
+            set(i.args, 0, at(i.args, 1));
+            set(i.args, 1, t);
+        }
+        let h = gvn_hash(g, i);
+        let j = g.heads[h];
+        let found = false;
+        while j >= 0 && !found {
+            if same_expr(i, at(f.insts, j)) {
+                replace(f, id, j);
+                found = true;
+            } else {
+                j = g.next[j];
+            }
+        }
+        if !found {
+            g.next[id] = g.heads[h];
+            g.heads[h] = id;
+            push(g.trail, h);
+        }
+    }
+    let kids = at(g.d.kids, b);
+    for k in 0..kids.len { gvn_block(g, at(kids, k)); }
+    while g.trail.len > mark {
+        let h = pop(g.trail);
+        g.heads[h] = g.next[g.heads[h]];
+    }
+}
+
+fn gvn(f: Func) {
+    let nbuckets = 64;
+    while nbuckets < f.insts.len { nbuckets = nbuckets * 2; }
+    let g = Gvn {
+        f: f,
+        d: compute_dom(f),
+        heads: array_new(nbuckets, -1),
+        next: array_new(f.insts.len, -1),
+        nbuckets: nbuckets,
+        trail: vec_new()
+    };
+    gvn_block(g, 0);
+    cleanup(f);
+    dce(f);
+    tidy(f);
+}
