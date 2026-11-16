@@ -1,0 +1,211 @@
+// Sparse conditional constant propagation (Wegman & Zadeck).
+//
+// Every value sits in a three-level lattice: TOP (no evidence yet), a known
+// constant, or BOTTOM (varies). Blocks start out unreachable and edges become
+// executable only when a branch can actually take them, so constants are
+// found through branches that fold and phis ignore inputs from dead edges.
+// Two worklists drive it: newly reachable blocks, and values whose lattice
+// cell dropped.
+
+const L_TOP = 0;
+const L_CONST = 1;
+const L_BOTTOM = 2;
+
+struct Sccp {
+    f: Func,
+    lat: [int],
+    cv: [int],
+    exec: [bool],
+    edges: Vec<[bool]>,     // per block, parallel to preds
+    uses: Vec<Vec<int>>,
+    home: [int],
+    flow: Vec<int>,
+    ssa: Vec<int>
+}
+
+fn can_fold(op: int, a: int, b: int) -> bool {
+    if op == OP_DIV || op == OP_MOD { return b != 0; }
+    if op == OP_SHL || op == OP_SHR { return b >= 0 && b < 64; }
+    true
+}
+
+fn bool_int(b: bool) -> int { if b { 1 } else { 0 } }
+
+// Evaluate a binary operator exactly as the generated code would.
+fn fold(op: int, a: int, b: int) -> int {
+    if op == OP_ADD { a + b }
+    else if op == OP_SUB { a - b }
+    else if op == OP_MUL { a * b }
+    else if op == OP_DIV { if b == -1 { 0 - a } else { a / b } }
+    else if op == OP_MOD { if b == -1 { 0 } else { a % b } }
+    else if op == OP_AND { a & b }
+    else if op == OP_OR { a | b }
+    else if op == OP_XOR { a ^ b }
+    else if op == OP_SHL { a << b }
+    else if op == OP_SHR { a >> b }
+    else if op == OP_EQ { bool_int(a == b) }
+    else if op == OP_NE { bool_int(a != b) }
+    else if op == OP_LT { bool_int(a < b) }
+    else if op == OP_LE { bool_int(a <= b) }
+    else if op == OP_GT { bool_int(a > b) }
+    else { bool_int(a >= b) }
+}
+
+fn lower_cell(s: Sccp, id: int, level: int, c: int) {
+    let old = s.lat[id];
+    if old == L_BOTTOM { return; }
+    if level == L_CONST && old == L_CONST {
+        if s.cv[id] == c { return; }
+        level = L_BOTTOM;
+    }
+    if level == L_TOP { return; }
+    s.lat[id] = level;
+    s.cv[id] = c;
+    push(s.ssa, id);
+}
+
+fn mark_edge(s: Sccp, from: int, to: int) {
+    let k = index_of(at(s.f.blocks, to).preds, from);
+    let flags = at(s.edges, to);
+    if flags[k] { return; }
+    flags[k] = true;
+    if !s.exec[to] {
+        s.exec[to] = true;
+        push(s.flow, to);
+    } else {
+        // A new way in: the phis here may have more to merge.
+        let blk = at(s.f.blocks, to);
+        for j in 0..blk.insts.len {
+            if at(s.f.insts, at(blk.insts, j)).op == OP_PHI { sccp_visit(s, at(blk.insts, j)); }
+        }
+    }
+}
+
+fn sccp_visit(s: Sccp, id: int) {
+    let i = at(s.f.insts, id);
+    let b = s.home[id];
+    let op = i.op;
+    if op == OP_PHI {
+        let flags = at(s.edges, b);
+        let level = L_TOP;
+        let c = 0;
+        for k in 0..i.args.len {
+            if !flags[k] { continue; }
+            let a = at(i.args, k);
+            if s.lat[a] == L_BOTTOM {
+                level = L_BOTTOM;
+            } else if s.lat[a] == L_CONST {
+                if level == L_TOP {
+                    level = L_CONST;
+                    c = s.cv[a];
+                } else if level == L_CONST && c != s.cv[a] {
+                    level = L_BOTTOM;
+                }
+            }
+        }
+        lower_cell(s, id, level, c);
+    } else if op == OP_JMP {
+        mark_edge(s, b, i.imm);
+    } else if op == OP_BR {
+        let c = at(i.args, 0);
+        if s.lat[c] == L_BOTTOM {
+            mark_edge(s, b, i.imm);
+            mark_edge(s, b, i.aux);
+        } else if s.lat[c] == L_CONST {
+            mark_edge(s, b, if s.cv[c] != 0 { i.imm } else { i.aux });
+        }
+    } else if op == OP_CONST {
+        lower_cell(s, id, L_CONST, i.imm);
+    } else if is_binary(op) {
+        let x = at(i.args, 0);
+        let y = at(i.args, 1);
+        let lx = s.lat[x];
+        let ly = s.lat[y];
+        if lx == L_CONST && ly == L_CONST {
+            if can_fold(op, s.cv[x], s.cv[y]) {
+                lower_cell(s, id, L_CONST, fold(op, s.cv[x], s.cv[y]));
+            } else {
+                lower_cell(s, id, L_BOTTOM, 0);
+            }
+        } else if (op == OP_MUL || op == OP_AND)
+            && ((lx == L_CONST && s.cv[x] == 0) || (ly == L_CONST && s.cv[y] == 0)) {
+            lower_cell(s, id, L_CONST, 0);
+        } else if lx == L_BOTTOM || ly == L_BOTTOM {
+            lower_cell(s, id, L_BOTTOM, 0);
+        }
+    } else if op == OP_NEG || op == OP_NOT {
+        let x = at(i.args, 0);
+        if s.lat[x] == L_CONST {
+            lower_cell(s, id, L_CONST, if op == OP_NEG { 0 - s.cv[x] } else { 1 - s.cv[x] });
+        } else if s.lat[x] == L_BOTTOM {
+            lower_cell(s, id, L_BOTTOM, 0);
+        }
+    } else if !has_effect(op) || op == OP_CALL || op == OP_CALLIND || op == OP_SYSCALL {
+        lower_cell(s, id, L_BOTTOM, 0);
+    }
+}
+
+fn sccp(f: Func) {
+    let n = f.insts.len;
+    let nb = f.blocks.len;
+    let s = Sccp {
+        f: f,
+        lat: array_new(n, L_TOP),
+        cv: array_new(n, 0),
+        exec: array_new(nb, false),
+        edges: vec_new(),
+        uses: vec_new(),
+        home: def_blocks(f),
+        flow: vec_new(),
+        ssa: vec_new()
+    };
+    for i in 0..n { push(s.uses, vec_new()); }
+    for b in 0..nb {
+        let blk = at(f.blocks, b);
+        push(s.edges, array_new(blk.preds.len, false));
+        for k in 0..blk.insts.len {
+            let id = at(blk.insts, k);
+            let i = at(f.insts, id);
+            for j in 0..i.args.len { push(at(s.uses, at(i.args, j)), id); }
+        }
+    }
+    s.exec[0] = true;
+    push(s.flow, 0);
+    while s.flow.len > 0 || s.ssa.len > 0 {
+        while s.flow.len > 0 {
+            let blk = at(f.blocks, pop(s.flow));
+            for k in 0..blk.insts.len { sccp_visit(s, at(blk.insts, k)); }
+        }
+        while s.ssa.len > 0 {
+            let users = at(s.uses, pop(s.ssa));
+            for k in 0..users.len {
+                let u = at(users, k);
+                if s.exec[s.home[u]] { sccp_visit(s, u); }
+            }
+        }
+    }
+    // Rewrite: materialise constants, fold decided branches.
+    for b in 0..nb {
+        if !s.exec[b] { continue; }
+        let blk = at(f.blocks, b);
+        for k in 0..blk.insts.len {
+            let id = at(blk.insts, k);
+            let i = at(f.insts, id);
+            if s.lat[id] == L_CONST && i.op != OP_CONST {
+                i.op = OP_CONST;
+                i.args = vec_new();
+                i.imm = s.cv[id];
+            }
+        }
+        let t = term(f, b);
+        if t.op == OP_BR && s.lat[at(t.args, 0)] == L_CONST {
+            let taken = if s.cv[at(t.args, 0)] != 0 { t.imm } else { t.aux };
+            let other = if s.cv[at(t.args, 0)] != 0 { t.aux } else { t.imm };
+            t.op = OP_JMP;
+            t.args = vec_new();
+            t.imm = taken;
+            if other != taken { remove_pred(f, other, b); }
+        }
+    }
+    tidy(f);
+}
