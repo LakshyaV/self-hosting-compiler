@@ -1,0 +1,134 @@
+// Loop-invariant code motion.
+//
+// Every loop first gets a preheader: a block that runs exactly once before
+// the loop is entered and whose only successor is the header. Then, innermost
+// loop first, any computation whose operands are all defined outside the loop
+// is moved to the preheader.
+//
+// Moving code out of a loop runs it even on paths where the loop would not
+// have reached it, so anything that can fault (a load, a division) is only
+// hoisted from blocks that execute on every trip: those dominating every
+// latch and every exit. Because loops are rotated, the body's first block
+// usually qualifies. Loads of mutable memory additionally need a loop that
+// neither stores nor calls.
+
+fn retarget(f: Func, b: int, old: int, new: int) {
+    let t = term(f, b);
+    if t.imm == old { t.imm = new; }
+    if t.op == OP_BR && t.aux == old { t.aux = new; }
+}
+
+fn make_preheader(f: Func, lp: Loop) {
+    let h = lp.head;
+    let hb = at(f.blocks, h);
+    let outside = vec_new();
+    let inside = vec_new();
+    for k in 0..hb.preds.len {
+        if lp.inside[at(hb.preds, k)] { push(inside, k); } else { push(outside, k); }
+    }
+    if outside.len == 1 && term(f, at(hb.preds, at(outside, 0))).op == OP_JMP { return; }
+    let p = new_block(f);
+    let pb = at(f.blocks, p);
+    for j in 0..hb.insts.len {
+        let i = at(f.insts, at(hb.insts, j));
+        if i.op != OP_PHI { continue; }
+        // Inputs from outside now arrive through the preheader, merged there
+        // if there are several.
+        let entering = at(i.args, at(outside, 0));
+        if outside.len > 1 {
+            let merged = vec_new();
+            for k in 0..outside.len { push(merged, at(i.args, at(outside, k))); }
+            entering = new_inst(f, OP_PHI, merged, 0);
+            push(pb.insts, entering);
+        }
+        let args = args1(entering);
+        for k in 0..inside.len { push(args, at(i.args, at(inside, k))); }
+        i.args = args;
+    }
+    push(pb.insts, new_inst(f, OP_JMP, vec_new(), h));
+    let preds = args1(p);
+    for k in 0..outside.len {
+        let o = at(hb.preds, at(outside, k));
+        push(pb.preds, o);
+        retarget(f, o, h, p);
+    }
+    for k in 0..inside.len { push(preds, at(hb.preds, at(inside, k))); }
+    hb.preds = preds;
+}
+
+fn can_fault(op: int) -> bool {
+    op == OP_DIV || op == OP_MOD || (op >= OP_LOAD && op <= OP_LOAD8C)
+}
+
+fn hoist_loop(f: Func, d: Dom, lp: Loop, home: [int]) {
+    let h = lp.head;
+    let hb = at(f.blocks, h);
+    let pre = -1;
+    let must_pass = vec_new();     // latches and exiting blocks
+    for k in 0..hb.preds.len {
+        let p = at(hb.preds, k);
+        if lp.inside[p] { push(must_pass, p); } else { pre = p; }
+    }
+    let clean = true;              // no stores or calls anywhere in the loop
+    let out = vec_new();
+    for k in 0..lp.body.len {
+        let b = at(lp.body, k);
+        succs(f, b, out);
+        for j in 0..out.len {
+            if !lp.inside[at(out, j)] { push(must_pass, b); }
+        }
+        let blk = at(f.blocks, b);
+        for j in 0..blk.insts.len {
+            let op = at(f.insts, at(blk.insts, j)).op;
+            if op == OP_STORE || op == OP_STORE8 || op == OP_CALL || op == OP_CALLIND || op == OP_SYSCALL {
+                clean = false;
+            }
+        }
+    }
+    // Visit the body in reverse postorder so operands are seen before uses.
+    let order = vec_copy(lp.body);
+    let keys = vec_new();
+    for k in 0..order.len { push(keys, d.num[at(order, k)]); }
+    sort_by_key(order, keys);
+    let pre_insts = at(f.blocks, pre).insts;
+    let jump = pop(pre_insts);
+    for k in 0..order.len {
+        let b = at(order, k);
+        let blk = at(f.blocks, b);
+        let every_trip = true;
+        for j in 0..must_pass.len {
+            if !dominates(d, b, at(must_pass, j)) { every_trip = false; }
+        }
+        let kept = vec_new();
+        for j in 0..blk.insts.len {
+            let id = at(blk.insts, j);
+            let i = at(f.insts, id);
+            let ok = is_pure(i.op) || ((i.op == OP_LOAD || i.op == OP_LOAD8) && clean);
+            if ok && can_fault(i.op) && !every_trip { ok = false; }
+            if ok {
+                for a in 0..i.args.len {
+                    if lp.inside[home[at(i.args, a)]] { ok = false; }
+                }
+            }
+            if ok {
+                push(pre_insts, id);
+                home[id] = pre;
+            } else {
+                push(kept, id);
+            }
+        }
+        blk.insts = kept;
+    }
+    push(pre_insts, jump);
+}
+
+fn licm(f: Func) {
+    let loops = find_loops(f, compute_dom(f));
+    if loops.len == 0 { return; }
+    for i in 0..loops.len { make_preheader(f, at(loops, i)); }
+    // Preheaders changed the graph; recompute before moving anything.
+    let d = compute_dom(f);
+    loops = find_loops(f, d);
+    let home = def_blocks(f);
+    for i in 0..loops.len { hoist_loop(f, d, at(loops, i), home); }
+}
