@@ -1,0 +1,188 @@
+// Machine IR: x86-64 instructions over virtual registers.
+//
+// Register numbers 0..15 are the physical registers in their hardware
+// encoding; anything from 16 up is virtual until register allocation rewrites
+// it. rsp and r15 (the heap pointer) are never allocated and are invisible to
+// liveness.
+
+const RAX = 0;
+const RCX = 1;
+const RDX = 2;
+const RBX = 3;
+const RSP = 4;
+const RBP = 5;
+const RSI = 6;
+const RDI = 7;
+const R8 = 8;
+const R9 = 9;
+const R10 = 10;
+const R11 = 11;
+const R12 = 12;
+const R13 = 13;
+const R14 = 14;
+const R15 = 15;
+const NREGS = 16;      // first virtual register
+const NCOLORS = 14;    // allocatable: everything but rsp and r15
+
+// Opcodes, grouped by operand shape (see shape_a / uses_b).
+const M_MOV = 0;       // a <- b
+const M_MOVI = 1;      // a <- imm
+const M_LEAFN = 2;     // a <- address of function imm
+const M_LEASTR = 3;    // a <- address of string imm
+const M_SETCC = 4;     // a <- flags satisfy condition x ? 1 : 0
+const M_LOAD = 5;      // a <- [b + c << x + imm]     (c = -1: no index)
+const M_LOAD8 = 6;     // a <- zero-extended byte
+const M_LEA = 7;       // a <- b + c << x + imm
+const M_STORE = 8;     // [b + c << x + imm] <- a
+const M_STORE8 = 9;
+const M_STOREI = 10;   // [b + c << x + imm] <- sign-extended 32-bit constant a
+const M_ADD = 11;      // a <- a op b
+const M_SUB = 12;
+const M_AND = 13;
+const M_OR = 14;
+const M_XOR = 15;
+const M_IMUL = 16;
+const M_ADDI = 17;     // a <- a op imm
+const M_SUBI = 18;
+const M_ANDI = 19;
+const M_ORI = 20;
+const M_XORI = 21;
+const M_SHLI = 22;
+const M_SARI = 23;
+const M_NEG = 24;
+const M_SHL = 25;      // a <- a << cl
+const M_SAR = 26;
+const M_IMUL3 = 27;    // a <- b * imm
+const M_CMP = 28;      // flags <- a ? b
+const M_CMPI = 29;     // flags <- a ? imm
+const M_TEST = 30;     // flags <- a & b
+const M_CQO = 31;      // rdx:rax <- sign-extend rax
+const M_IDIV = 32;     // rax, rdx <- rdx:rax / a, rdx:rax % a
+const M_JMP = 33;      // imm = block
+const M_JCC = 34;      // x = condition, imm = block
+const M_CALL = 35;     // imm = function, x = argument count
+const M_CALLR = 36;    // a = callee, x = argument count
+const M_RET = 37;
+const M_SYSCALL = 38;
+
+// x86 condition codes.
+const CC_E = 4;
+const CC_NE = 5;
+const CC_L = 12;
+const CC_GE = 13;
+const CC_LE = 14;
+const CC_G = 15;
+
+struct MInst { op: int, a: int, b: int, c: int, x: int, imm: int }
+
+struct MBlock { code: Vec<MInst>, next: Vec<int>, depth: int }
+
+struct MFunc {
+    name: string,
+    index: int,
+    blocks: Vec<MBlock>,     // indexed like the IR blocks
+    order: Vec<int>,         // layout order
+    nvreg: int,
+    nospill: Vec<bool>,      // per register: created by spilling, must not spill again
+    nslots: int,             // stack slots handed out to spilled registers
+    spills: int
+}
+
+fn mi(op: int, a: int, b: int) -> MInst {
+    MInst { op: op, a: a, b: b, c: -1, x: 0, imm: 0 }
+}
+
+fn mi_imm(op: int, a: int, imm: int) -> MInst {
+    MInst { op: op, a: a, b: -1, c: -1, x: 0, imm: imm }
+}
+
+fn arg_reg(k: int) -> int {
+    if k == 0 { RDI } else if k == 1 { RSI } else if k == 2 { RDX }
+    else if k == 3 { RCX } else if k == 4 { R8 } else { R9 }
+}
+
+fn is_caller_saved(r: int) -> bool {
+    r == RAX || r == RCX || r == RDX || r == RSI || r == RDI || (r >= R8 && r <= R11)
+}
+
+fn is_mem(op: int) -> bool { op >= M_LOAD && op <= M_STOREI }
+
+// How operand `a` is used: 0 not a register, 1 read, 2 written, 3 both.
+fn shape_a(op: int) -> int {
+    if op <= M_SETCC || op == M_LOAD || op == M_LOAD8 || op == M_LEA || op == M_IMUL3 { 2 }
+    else if op == M_STORE || op == M_STORE8 || op == M_CMP || op == M_CMPI || op == M_TEST
+        || op == M_IDIV || op == M_CALLR { 1 }
+    else if op >= M_ADD && op <= M_SAR { 3 }
+    else { 0 }
+}
+
+fn uses_b(op: int) -> bool {
+    op == M_MOV || is_mem(op) || (op >= M_ADD && op <= M_IMUL) || op == M_IMUL3
+        || op == M_CMP || op == M_TEST
+}
+
+fn add_reg(out: Vec<int>, r: int) {
+    if r != RSP && r != R15 { push(out, r); }
+}
+
+fn m_uses(m: MInst, out: Vec<int>) {
+    out.len = 0;
+    let op = m.op;
+    let sa = shape_a(op);
+    if sa == 1 || sa == 3 { add_reg(out, m.a); }
+    if uses_b(op) { add_reg(out, m.b); }
+    if is_mem(op) && m.c >= 0 { add_reg(out, m.c); }
+    if op == M_SHL || op == M_SAR {
+        push(out, RCX);
+    } else if op == M_CQO || op == M_RET {
+        push(out, RAX);
+    } else if op == M_IDIV {
+        push(out, RAX);
+        push(out, RDX);
+    } else if op == M_CALL || op == M_CALLR {
+        for k in 0..m.x { push(out, arg_reg(k)); }
+    } else if op == M_SYSCALL {
+        push(out, RAX);
+        push(out, RDI);
+        push(out, RSI);
+        push(out, RDX);
+    }
+}
+
+fn m_defs(m: MInst, out: Vec<int>) {
+    out.len = 0;
+    let op = m.op;
+    let sa = shape_a(op);
+    if sa >= 2 { add_reg(out, m.a); }
+    if op == M_CQO {
+        push(out, RDX);
+    } else if op == M_IDIV {
+        push(out, RAX);
+        push(out, RDX);
+    } else if op == M_CALL || op == M_CALLR {
+        // A call may overwrite every caller-saved register.
+        push(out, RAX);
+        push(out, RCX);
+        push(out, RDX);
+        push(out, RSI);
+        push(out, RDI);
+        push(out, R8);
+        push(out, R9);
+        push(out, R10);
+        push(out, R11);
+    } else if op == M_SYSCALL {
+        push(out, RAX);
+        push(out, RCX);
+        push(out, R11);
+    }
+}
+
+// Rename register `old` to `new` wherever the instruction mentions it.
+fn m_rename(m: MInst, old: int, new: int) {
+    if shape_a(m.op) != 0 && m.a == old { m.a = new; }
+    if uses_b(m.op) && m.b == old { m.b = new; }
+    if is_mem(m.op) && m.c == old { m.c = new; }
+}
+
+fn fits_i32(v: int) -> bool { v >= -2147483648 && v <= 2147483647 }
+fn fits_i8(v: int) -> bool { v >= -128 && v <= 127 }
