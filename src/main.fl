@@ -1,0 +1,153 @@
+// flintc: the Flint compiler driver.
+//
+//   source -> tokens -> AST -> typed AST -> SSA -> optimised SSA
+//          -> machine IR -> allocated machine IR -> ELF executable
+
+struct Options {
+    out: string,
+    files: Vec<string>,
+    optimize: bool,
+    dump_ir: bool,
+    stats: bool
+}
+
+fn usage<T>() -> T {
+    eprint("usage: flintc [options] -o OUTPUT FILE.fl...\n");
+    eprint("  -O0, -O1             optimisation off / on (default on)\n");
+    eprint("  --dump-ir            print the optimised SSA to stdout\n");
+    eprint("  --stats              print code size and spill counts to stderr\n");
+    exit(2)
+}
+
+fn parse_options() -> Options {
+    let o = Options { out: "", files: vec_new(), optimize: true, dump_ir: false, stats: false };
+    let i = 1;
+    while i < arg_count() {
+        let a = arg(i);
+        if a == "-o" {
+            if i + 1 >= arg_count() { usage(); }
+            o.out = arg(i + 1);
+            i += 1;
+        } else if a == "-O0" { o.optimize = false; }
+        else if a == "-O1" { o.optimize = true; }
+        else if a == "--dump-ir" { o.dump_ir = true; }
+        else if a == "--stats" { o.stats = true; }
+        else if starts_with(a, "-") { usage(); }
+        else { push(o.files, a); }
+        i += 1;
+    }
+    if o.files.len == 0 || (o.out == "" && !o.dump_ir) { usage(); }
+    o
+}
+
+fn optimize(m: Module) {
+    // Clean each function up first so the inliner sees its true size.
+    for i in 0..m.funcs.len {
+        let f = at(m.funcs, i);
+        sccp(f);
+        gvn(f);
+    }
+    inline_module(m);
+    for i in 0..m.funcs.len {
+        let f = at(m.funcs, i);
+        sccp(f);
+        gvn(f);
+        licm(f);
+        gvn(f);
+    }
+}
+
+// Functions reachable from main, by call or by having their address taken.
+fn reachable(m: Module, root: int) -> [bool] {
+    let seen = array_new(m.funcs.len, false);
+    let work = vec_new();
+    seen[root] = true;
+    push(work, root);
+    while work.len > 0 {
+        let f = at(m.funcs, pop(work));
+        for b in 0..f.blocks.len {
+            let blk = at(f.blocks, b);
+            for k in 0..blk.insts.len {
+                let i = at(f.insts, at(blk.insts, k));
+                if (i.op == OP_CALL || i.op == OP_FNADDR) && !seen[i.imm] {
+                    seen[i.imm] = true;
+                    push(work, i.imm);
+                }
+            }
+        }
+    }
+    seen
+}
+
+fn main() {
+    let o = parse_options();
+    let d = Diag { files: o.files };
+    let toks = vec_new();
+    for i in 0..o.files.len {
+        lex(d, read_file(at(o.files, i)), i, toks);
+    }
+    push(toks, Token { kind: T_EOF, text: "", ival: 0, loc: 0 });
+    let prog = parse_program(d, toks);
+    let c = check_program(d, prog);
+
+    let m = Module { funcs: vec_new(), strs: vec_new(), str_ids: map_new() };
+    let main_index = 0;
+    for i in 0..prog.fns.len {
+        let name = at(prog.fns, i).name;
+        if name == "main" { main_index = i; }
+        match map_get(c.fns, name) {
+            Some(info) => {
+                let f = lower_fn(c, m, info);
+                tidy(f);
+                push(m.funcs, f);
+            }
+            None => ()
+        }
+    }
+    if o.optimize { optimize(m); }
+    let live = reachable(m, main_index);
+    for i in 0..m.funcs.len {
+        if live[i] {
+            dce(at(m.funcs, i));
+            tidy(at(m.funcs, i));
+        }
+    }
+    if o.dump_ir {
+        let text = vec_new();
+        for i in 0..m.funcs.len {
+            if live[i] { dump_func(m, at(m.funcs, i), text); }
+        }
+        print(sb_str(text));
+    }
+    if o.out == "" { return; }
+
+    let e = Emitter {
+        code: vec_new(),
+        fn_off: array_new(m.funcs.len, -1),
+        block_off: array_new(0, 0),
+        jumps: vec_new(),
+        calls: vec_new(),
+        strs: vec_new(),
+        str_off: array_new(0, 0)
+    };
+    emit_start(e, main_index);
+    let nfuncs = 0;
+    let spills = 0;
+    for i in 0..m.funcs.len {
+        if !live[i] { continue; }
+        let mf = isel(m, at(m.funcs, i));
+        apply_colors(mf, alloc_linear(mf));
+        emit_func(e, mf);
+        nfuncs += 1;
+        spills = spills + mf.spills;
+    }
+    e.str_off = array_new(m.strs.len, -1);
+    let code_bytes = e.code.len;
+    link(e, m);
+    write_file(o.out, elf_image(e), 493);
+    if o.stats {
+        eprint(cat3("functions: ", int_to_str(nfuncs), "\n"));
+        eprint(cat3("code bytes: ", int_to_str(code_bytes), "\n"));
+        eprint(cat3("spilled registers: ", int_to_str(spills), "\n"));
+    }
+}
