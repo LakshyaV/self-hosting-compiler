@@ -1,0 +1,181 @@
+// Linear scan register allocation (Poletto & Sarkar).
+//
+// Instructions are numbered in layout order; instruction p reads its operands
+// at position 2p and writes its results at 2p+1. Each virtual register gets
+// one interval covering everything from its first definition to its last use,
+// and the intervals are handed registers in order of increasing start. When
+// none is free, whichever candidate ends furthest away is spilled.
+//
+// Physical registers named directly by the code (arguments, results, the
+// operands of idiv and shifts, everything a call clobbers) appear as fixed
+// busy ranges; a register is only eligible for an interval that overlaps none
+// of them.
+
+struct Lsra {
+    mf: MFunc,
+    start: [int],
+    stop: [int],
+    fixed: Vec<Vec<int>>,   // per physical register: (from, to) pairs, ascending
+    color: [int]
+}
+
+fn extend(ls: Lsra, v: int, pos: int) {
+    if pos < ls.start[v] { ls.start[v] = pos; }
+    if pos > ls.stop[v] { ls.stop[v] = pos; }
+}
+
+fn close_fixed(ls: Lsra, r: int, open: [int], last: [int]) {
+    if open[r] >= 0 {
+        push(at(ls.fixed, r), open[r]);
+        push(at(ls.fixed, r), last[r]);
+        open[r] = -1;
+    }
+}
+
+fn build_intervals(mf: MFunc, lv: Live) -> Lsra {
+    let n = mf.nvreg;
+    let ls = Lsra {
+        mf: mf,
+        start: array_new(n, 0x3FFFFFFFFFFF),
+        stop: array_new(n, -1),
+        fixed: vec_new(),
+        color: array_new(n, -1)
+    };
+    for r in 0..NREGS {
+        push(ls.fixed, vec_new());
+        ls.color[r] = r;
+    }
+    let open = array_new(NREGS, -1);
+    let last = array_new(NREGS, -1);
+    let regs = vec_new();
+    let pos = 0;
+    for oi in 0..mf.order.len {
+        let b = at(mf.order, oi);
+        let code = at(mf.blocks, b).code;
+        let first = 2 * pos;
+        bits_list(at(lv.ins, b), lv.words, regs);
+        for k in 0..regs.len {
+            let v = at(regs, k);
+            if v >= NREGS {
+                extend(ls, v, first);
+            } else {
+                open[v] = first;
+                last[v] = first;
+            }
+        }
+        for k in 0..code.len {
+            m_uses(at(code, k), regs);
+            for j in 0..regs.len {
+                let v = at(regs, j);
+                if v >= NREGS {
+                    extend(ls, v, 2 * pos);
+                } else {
+                    if open[v] < 0 { open[v] = 2 * pos; }
+                    last[v] = 2 * pos;
+                }
+            }
+            m_defs(at(code, k), regs);
+            for j in 0..regs.len {
+                let v = at(regs, j);
+                if v >= NREGS {
+                    extend(ls, v, 2 * pos + 1);
+                } else {
+                    close_fixed(ls, v, open, last);
+                    open[v] = 2 * pos + 1;
+                    last[v] = 2 * pos + 1;
+                }
+            }
+            pos += 1;
+        }
+        bits_list(at(lv.outs, b), lv.words, regs);
+        for k in 0..regs.len {
+            if at(regs, k) >= NREGS { extend(ls, at(regs, k), 2 * pos - 1); }
+        }
+        for r in 0..NREGS { close_fixed(ls, r, open, last); }
+    }
+    ls
+}
+
+// Does physical register `r` have a fixed range overlapping [from, to]?
+fn fixed_conflict(ls: Lsra, r: int, from: int, to: int) -> bool {
+    let ranges = at(ls.fixed, r);
+    // Binary search for the first range ending at or after `from`.
+    let lo = 0;
+    let hi = ranges.len / 2;
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if at(ranges, mid * 2 + 1) < from { lo = mid + 1; } else { hi = mid; }
+    }
+    lo < ranges.len / 2 && at(ranges, lo * 2) <= to
+}
+
+// One pass over the intervals. Returns the registers that had to be spilled.
+fn linear_scan(ls: Lsra) -> Vec<int> {
+    let mf = ls.mf;
+    let ids = vec_new();
+    let keys = vec_new();
+    for v in NREGS..mf.nvreg {
+        if ls.stop[v] >= 0 {
+            push(ids, v);
+            push(keys, ls.start[v]);
+        }
+    }
+    sort_by_key(ids, keys);
+    let spilled = vec_new();
+    let active = vec_new();
+    let busy = array_new(NREGS, false);
+    for k in 0..ids.len {
+        let v = at(ids, k);
+        // Expire intervals that ended before this one starts.
+        let still = vec_new();
+        for j in 0..active.len {
+            let a = at(active, j);
+            if ls.stop[a] < ls.start[v] {
+                busy[ls.color[a]] = false;
+            } else {
+                push(still, a);
+            }
+        }
+        active = still;
+        let got = -1;
+        for p in 0..NCOLORS {
+            let r = pref_reg(p);
+            if got < 0 && !busy[r] && !fixed_conflict(ls, r, ls.start[v], ls.stop[v]) { got = r; }
+        }
+        if got >= 0 {
+            ls.color[v] = got;
+            busy[got] = true;
+            push(active, v);
+            continue;
+        }
+        // No register: spill whichever of the candidates lives longest.
+        let victim = -1;
+        for j in 0..active.len {
+            let a = at(active, j);
+            if at(mf.nospill, a) || fixed_conflict(ls, ls.color[a], ls.start[v], ls.stop[v]) { continue; }
+            if victim < 0 || ls.stop[a] > ls.stop[victim] { victim = a; }
+        }
+        if victim >= 0 && (at(mf.nospill, v) || ls.stop[victim] > ls.stop[v]) {
+            ls.color[v] = ls.color[victim];
+            ls.color[victim] = -1;
+            push(spilled, victim);
+            remove_at(active, index_of(active, victim));
+            push(active, v);
+        } else if !at(mf.nospill, v) {
+            push(spilled, v);
+        } else {
+            alloc_fail(mf);
+        }
+    }
+    spilled
+}
+
+fn alloc_linear(mf: MFunc) -> [int] {
+    while true {
+        let ls = build_intervals(mf, liveness(mf));
+        let spilled = linear_scan(ls);
+        if spilled.len == 0 { return ls.color; }
+        rewrite_spills(mf, spilled);
+    }
+    array_new(0, 0)
+}
