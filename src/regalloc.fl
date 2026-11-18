@@ -1,0 +1,173 @@
+// What both register allocators share: liveness analysis, rewriting spilled
+// registers into stack slots, and applying the final assignment.
+
+struct Live { ins: Vec<[int]>, outs: Vec<[int]>, words: int }
+
+// Backward dataflow over the machine CFG:
+//   out[b] = union of in[s] over successors s
+//   in[b]  = gen[b] | (out[b] & ~kill[b])
+fn liveness(mf: MFunc) -> Live {
+    let nb = mf.blocks.len;
+    let words = (mf.nvreg + 31) / 32 + 1;
+    let lv = Live { ins: vec_new(), outs: vec_new(), words: words };
+    let gens = vec_new();
+    let kills = vec_new();
+    let uses = vec_new();
+    let defs = vec_new();
+    for b in 0..nb {
+        let gen = array_new(words, 0);
+        let kill = array_new(words, 0);
+        let code = at(mf.blocks, b).code;
+        for k in 0..code.len {
+            m_uses(at(code, k), uses);
+            for j in 0..uses.len {
+                if !bit_get(kill, at(uses, j)) { bit_set(gen, at(uses, j)); }
+            }
+            m_defs(at(code, k), defs);
+            for j in 0..defs.len { bit_set(kill, at(defs, j)); }
+        }
+        push(gens, gen);
+        push(kills, kill);
+        push(lv.ins, array_new(words, 0));
+        push(lv.outs, array_new(words, 0));
+    }
+    let changed = true;
+    while changed {
+        changed = false;
+        for oi in 0..mf.order.len {
+            let b = at(mf.order, mf.order.len - 1 - oi);
+            let out = at(lv.outs, b);
+            let inn = at(lv.ins, b);
+            let next = at(mf.blocks, b).next;
+            for k in 0..next.len {
+                let succ_in = at(lv.ins, at(next, k));
+                for w in 0..words { out[w] = out[w] | succ_in[w]; }
+            }
+            let gen = at(gens, b);
+            let kill = at(kills, b);
+            for w in 0..words {
+                let v = gen[w] | (out[w] & (0xFFFFFFFF ^ kill[w]));
+                if v != inn[w] {
+                    inn[w] = v;
+                    changed = true;
+                }
+            }
+        }
+    }
+    lv
+}
+
+// The registers in bit set `bits`, written into `out`.
+fn bits_list(bits: [int], words: int, out: Vec<int>) {
+    out.len = 0;
+    for w in 0..words {
+        let x = bits[w];
+        let i = w * 32;
+        while x != 0 {
+            if x & 1 == 1 { push(out, i); }
+            x = x >> 1;
+            i += 1;
+        }
+    }
+}
+
+fn slot_mem(op: int, r: int, slot: int) -> MInst {
+    MInst { op: op, a: r, b: RSP, c: -1, x: 0, imm: slot * 8 }
+}
+
+fn spill_temp(mf: MFunc) -> int {
+    mf.nvreg = mf.nvreg + 1;
+    push(mf.nospill, true);
+    mf.nvreg - 1
+}
+
+// Give each spilled register a stack slot and rewrite the code so it lives
+// there: every use loads it into a fresh short-lived register first, every
+// definition stores it straight after. The fresh registers are marked so the
+// next allocation round will not pick them to spill again.
+fn rewrite_spills(mf: MFunc, spilled: Vec<int>) {
+    let limit = mf.nvreg;
+    let slot = array_new(limit, -1);
+    for k in 0..spilled.len {
+        if slot[at(spilled, k)] < 0 {
+            slot[at(spilled, k)] = mf.nslots;
+            mf.nslots = mf.nslots + 1;
+            mf.spills = mf.spills + 1;
+        }
+    }
+    let uses = vec_new();
+    let defs = vec_new();
+    for b in 0..mf.blocks.len {
+        let blk = at(mf.blocks, b);
+        let code = vec_new();
+        for k in 0..blk.code.len {
+            let m = at(blk.code, k);
+            if m.op == M_MOV && m.a != RSP && m.b != R15 {
+                // Moves to or from a slot need no extra register.
+                let sa = if m.a < limit { slot[m.a] } else { -1 };
+                let sb = if m.b < limit { slot[m.b] } else { -1 };
+                if sb >= 0 && sa < 0 {
+                    push(code, slot_mem(M_LOAD, m.a, sb));
+                    continue;
+                }
+                if sa >= 0 && sb < 0 {
+                    push(code, slot_mem(M_STORE, m.b, sa));
+                    continue;
+                }
+            }
+            m_uses(m, uses);
+            m_defs(m, defs);
+            let after = vec_new();
+            for j in 0..uses.len {
+                let u = at(uses, j);
+                if u >= limit || slot[u] < 0 || index_of(uses, u) < j { continue; }
+                let t = spill_temp(mf);
+                push(code, slot_mem(M_LOAD, t, slot[u]));
+                m_rename(m, u, t);
+                if index_of(defs, u) >= 0 { push(after, slot_mem(M_STORE, t, slot[u])); }
+            }
+            for j in 0..defs.len {
+                let dreg = at(defs, j);
+                if dreg >= limit || slot[dreg] < 0 || index_of(uses, dreg) >= 0 { continue; }
+                let t = spill_temp(mf);
+                m_rename(m, dreg, t);
+                push(after, slot_mem(M_STORE, t, slot[dreg]));
+            }
+            push(code, m);
+            for j in 0..after.len { push(code, at(after, j)); }
+        }
+        blk.code = code;
+    }
+}
+
+// Replace virtual registers by their assigned physical ones and delete the
+// moves that became no-ops.
+fn apply_colors(mf: MFunc, color: [int]) {
+    for b in 0..mf.blocks.len {
+        let blk = at(mf.blocks, b);
+        let code = vec_new();
+        for k in 0..blk.code.len {
+            let m = at(blk.code, k);
+            if shape_a(m.op) != 0 && m.a >= NREGS { m.a = color[m.a]; }
+            if uses_b(m.op) && m.b >= NREGS { m.b = color[m.b]; }
+            if is_mem(m.op) && m.c >= NREGS { m.c = color[m.c]; }
+            if m.op == M_MOV && m.a == m.b { continue; }
+            push(code, m);
+        }
+        blk.code = code;
+    }
+}
+
+// Registers in the order the allocators prefer them: caller-saved first, so
+// short-lived values do not force a save in the prologue.
+fn pref_reg(k: int) -> int {
+    if k == 0 { RAX } else if k == 1 { RCX } else if k == 2 { RDX } else if k == 3 { RSI }
+    else if k == 4 { RDI } else if k == 5 { R8 } else if k == 6 { R9 } else if k == 7 { R10 }
+    else if k == 8 { R11 } else if k == 9 { RBX } else if k == 10 { RBP } else if k == 11 { R12 }
+    else if k == 12 { R13 } else { R14 }
+}
+
+fn alloc_fail<T>(mf: MFunc) -> T {
+    eprint(cat3("internal error: ran out of registers in '", mf.name, "'\n"));
+    exit(1)
+}
