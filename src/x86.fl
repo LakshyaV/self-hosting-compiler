@@ -1,0 +1,391 @@
+// x86-64 machine code and the ELF executable around it.
+//
+// Instructions are encoded straight to bytes; there is no assembler and no
+// linker. The output is a static, position-dependent ELF64 executable with a
+// single loadable segment holding the headers, the code and the string
+// constants. References between functions and to strings are rip-relative,
+// recorded as fixups and patched once everything has an offset.
+
+const ELF_BASE = 0x400000;
+const ELF_HEADERS = 120;        // ELF header (64) + one program header (56)
+const HEAP_ADDR = 0x1000000000; // must match HEAP_BASE in lib/rt.fl
+const HEAP_SIZE = 0x1000000000; // 64 GiB of address space, committed on touch
+
+struct Emitter {
+    code: Vec<int>,
+    fn_off: [int],       // function index -> offset in `code`, or -1
+    block_off: [int],    // current function's blocks
+    jumps: Vec<int>,     // (position of rel32, block) within the current function
+    calls: Vec<int>,     // (position of rel32, function)
+    strs: Vec<int>,      // (position of rel32, string)
+    str_off: [int]
+}
+
+fn e8(e: Emitter, b: int) { push(e.code, b & 255); }
+
+fn e32(e: Emitter, v: int) {
+    e8(e, v);
+    e8(e, v >> 8);
+    e8(e, v >> 16);
+    e8(e, v >> 24);
+}
+
+fn e64(e: Emitter, v: int) {
+    e32(e, v);
+    e32(e, v >> 32);
+}
+
+fn patch32(e: Emitter, pos: int, v: int) {
+    set(e.code, pos, v & 255);
+    set(e.code, pos + 1, (v >> 8) & 255);
+    set(e.code, pos + 2, (v >> 16) & 255);
+    set(e.code, pos + 3, (v >> 24) & 255);
+}
+
+// REX prefix: W selects 64-bit operands; R, X and B carry the high bit of
+// the ModRM reg field, the SIB index and the ModRM rm / SIB base.
+fn rex(e: Emitter, w: bool, r: int, x: int, b: int, force: bool) {
+    let v = 0x40 | (if w { 8 } else { 0 }) | (((r >> 3) & 1) << 2) | (((x >> 3) & 1) << 1) | ((b >> 3) & 1);
+    if v != 0x40 || force { e8(e, v); }
+}
+
+fn modrm(e: Emitter, mode: int, r: int, rm: int) {
+    e8(e, (mode << 6) | ((r & 7) << 3) | (rm & 7));
+}
+
+// REX.W + opcode + register-direct ModRM.
+fn op_rr(e: Emitter, opcode: int, r: int, rm: int) {
+    rex(e, true, r, 0, rm, false);
+    e8(e, opcode);
+    modrm(e, 3, r, rm);
+}
+
+fn rex_mem(e: Emitter, w: bool, r: int, m: MInst, force: bool) {
+    rex(e, w, r, if m.c < 0 { 0 } else { m.c }, m.b, force);
+}
+
+// ModRM (+ SIB, + displacement) for the memory operand of `m`.
+fn mem_operand(e: Emitter, r: int, m: MInst) {
+    let base = m.b;
+    let disp = m.imm;
+    // rbp/r13 as a base cannot use the no-displacement form.
+    let mode = if disp == 0 && (base & 7) != 5 { 0 } else if fits_i8(disp) { 1 } else { 2 };
+    if m.c < 0 && (base & 7) != 4 {
+        modrm(e, mode, r, base);
+    } else {
+        // An index, or rsp/r12 as base, needs a SIB byte.
+        modrm(e, mode, r, 4);
+        let idx = if m.c < 0 { 4 } else { m.c & 7 };
+        e8(e, (m.x << 6) | (idx << 3) | (base & 7));
+    }
+    if mode == 1 { e8(e, disp); } else if mode == 2 { e32(e, disp); }
+}
+
+// a <- a op imm, from the 0x81 / 0x83 immediate group.
+fn op_imm(e: Emitter, ext: int, a: int, imm: int) {
+    rex(e, true, 0, 0, a, false);
+    if fits_i8(imm) {
+        e8(e, 0x83);
+        modrm(e, 3, ext, a);
+        e8(e, imm);
+    } else {
+        e8(e, 0x81);
+        modrm(e, 3, ext, a);
+        e32(e, imm);
+    }
+}
+
+fn rip_relative(e: Emitter, a: int, fixups: Vec<int>, target: int) {
+    rex(e, true, a, 0, 0, false);
+    e8(e, 0x8D);
+    modrm(e, 0, a, 5);
+    push(fixups, e.code.len);
+    push(fixups, target);
+    e32(e, 0);
+}
+
+fn encode(e: Emitter, m: MInst) {
+    let op = m.op;
+    let a = m.a;
+    let b = m.b;
+    if op == M_MOV { op_rr(e, 0x89, b, a); }
+    else if op == M_MOVI {
+        if m.imm >= 0 && m.imm <= 0xFFFFFFFF {
+            // mov r32, imm32 zero-extends
+            rex(e, false, 0, 0, a, false);
+            e8(e, 0xB8 + (a & 7));
+            e32(e, m.imm);
+        } else if fits_i32(m.imm) {
+            rex(e, true, 0, 0, a, false);
+            e8(e, 0xC7);
+            modrm(e, 3, 0, a);
+            e32(e, m.imm);
+        } else {
+            rex(e, true, 0, 0, a, false);
+            e8(e, 0xB8 + (a & 7));
+            e64(e, m.imm);
+        }
+    }
+    else if op == M_LEAFN { rip_relative(e, a, e.calls, m.imm); }
+    else if op == M_LEASTR { rip_relative(e, a, e.strs, m.imm); }
+    else if op == M_SETCC {
+        // setcc r8, then widen; the REX prefix makes sil/dil addressable.
+        rex(e, false, 0, 0, a, true);
+        e8(e, 0x0F);
+        e8(e, 0x90 + m.x);
+        modrm(e, 3, 0, a);
+        rex(e, true, a, 0, a, false);
+        e8(e, 0x0F);
+        e8(e, 0xB6);
+        modrm(e, 3, a, a);
+    }
+    else if op == M_LOAD || op == M_LEA || op == M_STORE {
+        rex_mem(e, true, a, m, false);
+        e8(e, if op == M_LOAD { 0x8B } else if op == M_LEA { 0x8D } else { 0x89 });
+        mem_operand(e, a, m);
+    }
+    else if op == M_LOAD8 {
+        rex_mem(e, true, a, m, false);
+        e8(e, 0x0F);
+        e8(e, 0xB6);
+        mem_operand(e, a, m);
+    }
+    else if op == M_STORE8 {
+        rex_mem(e, false, a, m, true);
+        e8(e, 0x88);
+        mem_operand(e, a, m);
+    }
+    else if op == M_STOREI {
+        rex_mem(e, true, 0, m, false);
+        e8(e, 0xC7);
+        mem_operand(e, 0, m);
+        e32(e, a);
+    }
+    else if op == M_ADD { op_rr(e, 0x01, b, a); }
+    else if op == M_SUB { op_rr(e, 0x29, b, a); }
+    else if op == M_AND { op_rr(e, 0x21, b, a); }
+    else if op == M_OR { op_rr(e, 0x09, b, a); }
+    else if op == M_XOR { op_rr(e, 0x31, b, a); }
+    else if op == M_CMP { op_rr(e, 0x39, b, a); }
+    else if op == M_TEST { op_rr(e, 0x85, b, a); }
+    else if op == M_IMUL {
+        rex(e, true, a, 0, b, false);
+        e8(e, 0x0F);
+        e8(e, 0xAF);
+        modrm(e, 3, a, b);
+    }
+    else if op == M_IMUL3 {
+        rex(e, true, a, 0, b, false);
+        if fits_i8(m.imm) {
+            e8(e, 0x6B);
+            modrm(e, 3, a, b);
+            e8(e, m.imm);
+        } else {
+            e8(e, 0x69);
+            modrm(e, 3, a, b);
+            e32(e, m.imm);
+        }
+    }
+    else if op == M_ADDI { op_imm(e, 0, a, m.imm); }
+    else if op == M_ORI { op_imm(e, 1, a, m.imm); }
+    else if op == M_ANDI { op_imm(e, 4, a, m.imm); }
+    else if op == M_SUBI { op_imm(e, 5, a, m.imm); }
+    else if op == M_XORI { op_imm(e, 6, a, m.imm); }
+    else if op == M_CMPI { op_imm(e, 7, a, m.imm); }
+    else if op == M_SHLI || op == M_SARI {
+        op_rr(e, 0xC1, if op == M_SHLI { 4 } else { 7 }, a);
+        e8(e, m.imm);
+    }
+    else if op == M_SHL { op_rr(e, 0xD3, 4, a); }
+    else if op == M_SAR { op_rr(e, 0xD3, 7, a); }
+    else if op == M_NEG { op_rr(e, 0xF7, 3, a); }
+    else if op == M_IDIV { op_rr(e, 0xF7, 7, a); }
+    else if op == M_CQO {
+        e8(e, 0x48);
+        e8(e, 0x99);
+    }
+    else if op == M_CALL {
+        e8(e, 0xE8);
+        push(e.calls, e.code.len);
+        push(e.calls, m.imm);
+        e32(e, 0);
+    }
+    else if op == M_CALLR {
+        rex(e, false, 0, 0, a, false);
+        e8(e, 0xFF);
+        modrm(e, 3, 2, a);
+    }
+    else if op == M_SYSCALL {
+        e8(e, 0x0F);
+        e8(e, 0x05);
+    }
+}
+
+fn push_pop(e: Emitter, opcode: int, r: int) {
+    rex(e, false, 0, 0, r, false);
+    e8(e, opcode + (r & 7));
+}
+
+fn callee_saved(k: int) -> int {
+    if k == 0 { RBX } else if k == 1 { RBP } else if k == 2 { R12 } else if k == 3 { R13 } else { R14 }
+}
+
+fn jump_to(e: Emitter, block: int) {
+    push(e.jumps, e.code.len);
+    push(e.jumps, block);
+    e32(e, 0);
+}
+
+// Emit one function whose registers have all been assigned.
+fn emit_func(e: Emitter, mf: MFunc) {
+    e.fn_off[mf.index] = e.code.len;
+    // Save the callee-saved registers the body writes.
+    let saved = array_new(NREGS, false);
+    let defs = vec_new();
+    for b in 0..mf.blocks.len {
+        let code = at(mf.blocks, b).code;
+        for k in 0..code.len {
+            m_defs(at(code, k), defs);
+            for j in 0..defs.len { saved[at(defs, j)] = true; }
+        }
+    }
+    for k in 0..5 {
+        if saved[callee_saved(k)] { push_pop(e, 0x50, callee_saved(k)); }
+    }
+    let frame = mf.nslots * 8;
+    if frame > 0 { op_imm(e, 5, RSP, frame); }
+    e.block_off = array_new(mf.blocks.len, 0);
+    e.jumps = vec_new();
+    for oi in 0..mf.order.len {
+        let b = at(mf.order, oi);
+        let following = if oi + 1 < mf.order.len { at(mf.order, oi + 1) } else { -1 };
+        e.block_off[b] = e.code.len;
+        let code = at(mf.blocks, b).code;
+        let k = 0;
+        while k < code.len {
+            let m = at(code, k);
+            if m.op == M_JMP {
+                // Falling through needs no jump.
+                if m.imm != following {
+                    e8(e, 0xE9);
+                    jump_to(e, m.imm);
+                }
+            } else if m.op == M_JCC {
+                // Always followed by the jump for the false edge. If the
+                // true target is next, branch on the opposite condition.
+                let other = at(code, k + 1).imm;
+                e8(e, 0x0F);
+                if m.imm == following {
+                    e8(e, 0x80 + (m.x ^ 1));
+                    jump_to(e, other);
+                    k += 1;
+                } else {
+                    e8(e, 0x80 + m.x);
+                    jump_to(e, m.imm);
+                }
+            } else if m.op == M_RET {
+                if frame > 0 { op_imm(e, 0, RSP, frame); }
+                for j in 0..5 {
+                    if saved[callee_saved(4 - j)] { push_pop(e, 0x58, callee_saved(4 - j)); }
+                }
+                e8(e, 0xC3);
+            } else {
+                encode(e, m);
+            }
+            k += 1;
+        }
+    }
+    let j = 0;
+    while j < e.jumps.len {
+        let pos = at(e.jumps, j);
+        patch32(e, pos, e.block_off[at(e.jumps, j + 1)] - (pos + 4));
+        j += 2;
+    }
+}
+
+// Process entry point: reserve the heap, remember the initial stack pointer
+// (argc/argv live there), run main, exit.
+fn emit_start(e: Emitter, main_index: int) {
+    encode(e, mi_imm(M_MOVI, RAX, 9));               // mmap
+    encode(e, mi_imm(M_MOVI, RDI, HEAP_ADDR));
+    encode(e, mi_imm(M_MOVI, RSI, HEAP_SIZE));
+    encode(e, mi_imm(M_MOVI, RDX, 3));               // PROT_READ | PROT_WRITE
+    encode(e, mi_imm(M_MOVI, R10, 0x4032));          // PRIVATE | FIXED | ANONYMOUS | NORESERVE
+    encode(e, mi_imm(M_MOVI, R8, -1));
+    encode(e, mi_imm(M_MOVI, R9, 0));
+    encode(e, mi(M_SYSCALL, -1, -1));
+    encode(e, mi(M_MOV, R15, RAX));
+    encode(e, MInst { op: M_STORE, a: RSP, b: R15, c: -1, x: 0, imm: 0 });
+    encode(e, mi_imm(M_ADDI, R15, 16));
+    encode(e, mi_imm(M_CALL, -1, main_index));
+    encode(e, mi_imm(M_MOVI, RDI, 0));
+    encode(e, mi_imm(M_MOVI, RAX, 231));             // exit_group
+    encode(e, mi(M_SYSCALL, -1, -1));
+}
+
+// Lay out the string constants that were referenced and resolve all fixups.
+fn link(e: Emitter, m: Module) {
+    while e.code.len % 8 != 0 { e8(e, 0); }
+    let j = 0;
+    while j < e.strs.len {
+        let pos = at(e.strs, j);
+        let id = at(e.strs, j + 1);
+        if e.str_off[id] < 0 {
+            // [length][bytes, zero padded to a multiple of 8]
+            let s = at(m.strs, id);
+            e.str_off[id] = e.code.len;
+            e64(e, str_len(s));
+            for k in 0..str_len(s) { e8(e, char_at(s, k)); }
+            while e.code.len % 8 != 0 { e8(e, 0); }
+        }
+        patch32(e, pos, e.str_off[id] - (pos + 4));
+        j += 2;
+    }
+    j = 0;
+    while j < e.calls.len {
+        let pos = at(e.calls, j);
+        patch32(e, pos, e.fn_off[at(e.calls, j + 1)] - (pos + 4));
+        j += 2;
+    }
+}
+
+fn elf_image(e: Emitter) -> string {
+    let size = ELF_HEADERS + e.code.len;
+    let h = Emitter { code: vec_new(), fn_off: e.fn_off, block_off: e.fn_off, jumps: e.jumps, calls: e.calls, strs: e.strs, str_off: e.fn_off };
+    // ELF header
+    e32(h, 0x464C457F);          // magic
+    e8(h, 2);                    // 64-bit
+    e8(h, 1);                    // little endian
+    e8(h, 1);                    // ELF version
+    e8(h, 0);                    // System V ABI
+    e64(h, 0);
+    e8(h, 2);                    // e_type: executable
+    e8(h, 0);
+    e8(h, 0x3E);                 // e_machine: x86-64
+    e8(h, 0);
+    e32(h, 1);                   // e_version
+    e64(h, ELF_BASE + ELF_HEADERS); // e_entry: the start stub comes first
+    e64(h, 64);                  // e_phoff
+    e64(h, 0);                   // e_shoff
+    e32(h, 0);                   // e_flags
+    e8(h, 64);                   // e_ehsize
+    e8(h, 0);
+    e8(h, 56);                   // e_phentsize
+    e8(h, 0);
+    e8(h, 1);                    // e_phnum
+    e8(h, 0);
+    e8(h, 64);                   // e_shentsize
+    e8(h, 0);
+    e32(h, 0);                   // e_shnum, e_shstrndx
+    // Program header: one segment, read + execute
+    e32(h, 1);                   // PT_LOAD
+    e32(h, 5);                   // PF_R | PF_X
+    e64(h, 0);                   // p_offset
+    e64(h, ELF_BASE);            // p_vaddr
+    e64(h, ELF_BASE);            // p_paddr
+    e64(h, size);                // p_filesz
+    e64(h, size);                // p_memsz
+    e64(h, 0x1000);              // p_align
+    for k in 0..e.code.len { push(h.code, at(e.code, k)); }
+    str_from_array(h.code.data, h.code.len)
+}
