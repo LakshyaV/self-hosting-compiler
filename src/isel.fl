@@ -1,0 +1,433 @@
+// Instruction selection: SSA IR -> x86-64 machine IR.
+//
+// Blocks are selected bottom-up (and in reverse layout order), so every use
+// of a value is seen before its definition. That lets a use absorb its
+// operand: an address computation folds into a memory operand's
+// base + index*scale + displacement, a comparison folds into the branch that
+// tests it, a constant becomes an immediate. `need` counts the uses of each
+// value that still want it in a register; a pure instruction whose count has
+// dropped to zero by the time it is reached is simply not emitted.
+//
+// Phis are lowered here too. Critical edges are split first so each phi input
+// has a block of its own to be copied in, and the copies for one edge are
+// sequenced as a parallel move.
+
+struct Isel {
+    m: Module,
+    f: Func,
+    mf: MFunc,
+    need: [int],
+    vreg: [int],           // IR value -> virtual register, or -1
+    seq: Vec<MInst>,       // code for the instruction being selected
+    am_base: int,          // addressing mode produced by `addr`
+    am_idx: int,
+    am_scale: int,
+    am_disp: int
+}
+
+fn split_critical_edges(f: Func) {
+    let n = f.blocks.len;
+    for b in 0..n {
+        if !has_phi(f, b) { continue; }
+        let blk = at(f.blocks, b);
+        for k in 0..blk.preds.len {
+            let p = at(blk.preds, k);
+            if term(f, p).op != OP_BR { continue; }
+            let e = new_block(f);
+            let eb = at(f.blocks, e);
+            push(eb.insts, new_inst(f, OP_JMP, vec_new(), b));
+            push(eb.preds, p);
+            retarget(f, p, b, e);
+            set(blk.preds, k, e);
+        }
+    }
+}
+
+fn fresh_vreg(s: Isel) -> int {
+    s.mf.nvreg = s.mf.nvreg + 1;
+    push(s.mf.nospill, false);
+    s.mf.nvreg - 1
+}
+
+fn vreg_of(s: Isel, v: int) -> int {
+    if s.vreg[v] < 0 { s.vreg[v] = fresh_vreg(s); }
+    s.vreg[v]
+}
+
+fn out(s: Isel, m: MInst) { push(s.seq, m); }
+
+fn is_imm(s: Isel, v: int) -> bool {
+    let i = at(s.f.insts, v);
+    i.op == OP_CONST && fits_i32(i.imm)
+}
+
+fn imm_of(s: Isel, v: int) -> int { at(s.f.insts, v).imm }
+
+// Put value `v` in register `dst`. Constants and addresses are materialised
+// here, at the use, rather than kept live in a register from wherever the IR
+// happened to mention them.
+fn move_to(s: Isel, dst: int, v: int) {
+    let i = at(s.f.insts, v);
+    if i.op == OP_CONST { out(s, mi_imm(M_MOVI, dst, i.imm)); }
+    else if i.op == OP_STR { out(s, mi_imm(M_LEASTR, dst, i.imm)); }
+    else if i.op == OP_FNADDR { out(s, mi_imm(M_LEAFN, dst, i.imm)); }
+    else { out(s, mi(M_MOV, dst, vreg_of(s, v))); }
+}
+
+// A register holding `v`.
+fn reg(s: Isel, v: int) -> int {
+    let op = at(s.f.insts, v).op;
+    if op == OP_CONST || op == OP_STR || op == OP_FNADDR {
+        let t = fresh_vreg(s);
+        move_to(s, t, v);
+        t
+    } else {
+        vreg_of(s, v)
+    }
+}
+
+// If `v` is `z << k` with k in 0..3, the scale k; otherwise -1.
+fn scale_of(s: Isel, v: int) -> int {
+    let i = at(s.f.insts, v);
+    if i.op != OP_SHL { return -1; }
+    let k = at(s.f.insts, at(i.args, 1));
+    if k.op == OP_CONST && k.imm >= 0 && k.imm <= 3 { k.imm } else { -1 }
+}
+
+fn mem(s: Isel, op: int, a: int) -> MInst {
+    MInst { op: op, a: a, b: s.am_base, c: s.am_idx, x: s.am_scale, imm: s.am_disp }
+}
+
+// Use `v` as the base of an addressing mode: sets base, no index, `disp`.
+fn addr_plain(s: Isel, v: int, disp: int) {
+    s.am_base = reg(s, v);
+    s.am_idx = -1;
+    s.am_scale = 0;
+    s.am_disp = disp;
+}
+
+// Split the sum `x + y` into an addressing mode. Returns the shift that was
+// folded into the index (so the caller can settle its use count), or -1.
+fn addr_sum(s: Isel, x: int, y: int, disp: int) -> int {
+    s.am_idx = -1;
+    s.am_scale = 0;
+    s.am_disp = disp;
+    if is_imm(s, y) && fits_i32(disp + imm_of(s, y)) {
+        s.am_disp = disp + imm_of(s, y);
+        s.am_base = reg(s, x);
+        return -1;
+    }
+    if is_imm(s, x) && fits_i32(disp + imm_of(s, x)) {
+        s.am_disp = disp + imm_of(s, x);
+        s.am_base = reg(s, y);
+        return -1;
+    }
+    let shifted = if scale_of(s, y) >= 0 { y } else if scale_of(s, x) >= 0 { x } else { -1 };
+    if shifted < 0 {
+        s.am_base = reg(s, x);
+        s.am_idx = reg(s, y);
+        return -1;
+    }
+    s.am_base = reg(s, if shifted == y { x } else { y });
+    s.am_idx = reg(s, at(at(s.f.insts, shifted).args, 0));
+    s.am_scale = scale_of(s, shifted);
+    shifted
+}
+
+// Addressing mode for memory at `v + disp`, folding `v` when it is a sum.
+fn addr(s: Isel, v: int, disp: int) {
+    let i = at(s.f.insts, v);
+    if i.op != OP_ADD {
+        addr_plain(s, v, disp);
+        return;
+    }
+    let shifted = addr_sum(s, at(i.args, 0), at(i.args, 1), disp);
+    s.need[v] = s.need[v] - 1;
+    // If that was the sum's last use it will never be emitted, and with it
+    // goes its own use of the shift.
+    if shifted >= 0 && s.need[v] == 0 { s.need[shifted] = s.need[shifted] - 1; }
+}
+
+fn cc_of(op: int) -> int {
+    if op == OP_EQ { CC_E } else if op == OP_NE { CC_NE } else if op == OP_LT { CC_L }
+    else if op == OP_LE { CC_LE } else if op == OP_GT { CC_G } else { CC_GE }
+}
+
+// Condition after swapping the operands of a comparison.
+fn cc_swap(cc: int) -> int {
+    if cc == CC_L { CC_G } else if cc == CC_G { CC_L } else if cc == CC_LE { CC_GE }
+    else if cc == CC_GE { CC_LE } else { cc }
+}
+
+// Emit the comparison `x op y`; returns the condition code to test.
+fn sel_cmp(s: Isel, op: int, x: int, y: int) -> int {
+    if is_imm(s, y) {
+        out(s, mi_imm(M_CMPI, reg(s, x), imm_of(s, y)));
+        cc_of(op)
+    } else if is_imm(s, x) {
+        out(s, mi_imm(M_CMPI, reg(s, y), imm_of(s, x)));
+        cc_swap(cc_of(op))
+    } else {
+        let rx = reg(s, x);
+        let ry = reg(s, y);
+        out(s, mi(M_CMP, rx, ry));
+        cc_of(op)
+    }
+}
+
+fn log2_exact(c: int) -> int {
+    if c <= 0 || (c & (c - 1)) != 0 { return -1; }
+    let k = 0;
+    while (1 << k) != c { k += 1; }
+    k
+}
+
+fn sel_binary(s: Isel, id: int, i: Inst) {
+    let op = i.op;
+    let x = at(i.args, 0);
+    let y = at(i.args, 1);
+    let d = vreg_of(s, id);
+    if op == OP_ADD {
+        // lea is a three-operand add that also takes a scaled index.
+        let shifted = addr_sum(s, x, y, 0);
+        if shifted >= 0 { s.need[shifted] = s.need[shifted] - 1; }
+        out(s, mem(s, M_LEA, d));
+    } else if op == OP_SUB && is_imm(s, y) && fits_i32(0 - imm_of(s, y)) {
+        addr_plain(s, x, 0 - imm_of(s, y));
+        out(s, mem(s, M_LEA, d));
+    } else if op == OP_MUL && (is_imm(s, x) || is_imm(s, y)) {
+        let c = if is_imm(s, y) { imm_of(s, y) } else { imm_of(s, x) };
+        let r = reg(s, if is_imm(s, y) { x } else { y });
+        let k = log2_exact(c);
+        if k >= 0 {
+            // Multiplying by a power of two is a shift.
+            out(s, mi(M_MOV, d, r));
+            out(s, mi_imm(M_SHLI, d, k));
+        } else {
+            let m = mi(M_IMUL3, d, r);
+            m.imm = c;
+            out(s, m);
+        }
+    } else if op == OP_DIV || op == OP_MOD {
+        let rx = reg(s, x);
+        let ry = reg(s, y);
+        out(s, mi(M_MOV, RAX, rx));
+        out(s, mi(M_CQO, -1, -1));
+        out(s, mi(M_IDIV, ry, -1));
+        out(s, mi(M_MOV, d, if op == OP_DIV { RAX } else { RDX }));
+    } else if op == OP_SHL || op == OP_SHR {
+        if is_imm(s, y) {
+            out(s, mi(M_MOV, d, reg(s, x)));
+            out(s, mi_imm(if op == OP_SHL { M_SHLI } else { M_SARI }, d, imm_of(s, y) & 63));
+        } else {
+            let rx = reg(s, x);
+            let ry = reg(s, y);
+            out(s, mi(M_MOV, RCX, ry));
+            out(s, mi(M_MOV, d, rx));
+            out(s, mi(if op == OP_SHL { M_SHL } else { M_SAR }, d, -1));
+        }
+    } else if op >= OP_EQ {
+        let cc = sel_cmp(s, op, x, y);
+        let m = mi(M_SETCC, d, -1);
+        m.x = cc;
+        out(s, m);
+    } else {
+        // sub, mul, and, or, xor in two-address form: d <- x; d <- d op y.
+        let rr = if op == OP_SUB { M_SUB } else if op == OP_MUL { M_IMUL } else if op == OP_AND { M_AND }
+            else if op == OP_OR { M_OR } else { M_XOR };
+        if op != OP_SUB && op != OP_MUL && (is_imm(s, x) || is_imm(s, y)) {
+            let c = if is_imm(s, y) { imm_of(s, y) } else { imm_of(s, x) };
+            out(s, mi(M_MOV, d, reg(s, if is_imm(s, y) { x } else { y })));
+            out(s, mi_imm(rr + (M_ADDI - M_ADD), d, c));
+        } else {
+            let rx = reg(s, x);
+            let ry = reg(s, y);
+            out(s, mi(M_MOV, d, rx));
+            out(s, mi(rr, d, ry));
+        }
+    }
+}
+
+// Copies for the phis of `target` along the edge from block `b`, performed
+// as one parallel move: no copy may read a register an earlier copy wrote.
+fn sel_phi_moves(s: Isel, b: int, target: int) {
+    let tb = at(s.f.blocks, target);
+    let k = index_of(tb.preds, b);
+    let dsts = vec_new();
+    let srcs = vec_new();     // IR values
+    let src_regs = vec_new(); // their registers, or -1 for constants
+    for j in 0..tb.insts.len {
+        let id = at(tb.insts, j);
+        let i = at(s.f.insts, id);
+        if i.op != OP_PHI || s.need[id] == 0 { continue; }
+        let v = at(i.args, k);
+        if v == id { continue; }
+        let vop = at(s.f.insts, v).op;
+        push(dsts, vreg_of(s, id));
+        push(srcs, v);
+        push(src_regs, if vop == OP_CONST || vop == OP_STR || vop == OP_FNADDR { -1 } else { vreg_of(s, v) });
+    }
+    let left = dsts.len;
+    let done = array_new(dsts.len, false);
+    while left > 0 {
+        let progress = false;
+        for j in 0..dsts.len {
+            if done[j] { continue; }
+            // Safe once nothing still pending reads this destination.
+            let blocked = false;
+            for q in 0..dsts.len {
+                if !done[q] && q != j && at(src_regs, q) == at(dsts, j) { blocked = true; }
+            }
+            if blocked { continue; }
+            if at(src_regs, j) >= 0 {
+                out(s, mi(M_MOV, at(dsts, j), at(src_regs, j)));
+            } else {
+                move_to(s, at(dsts, j), at(srcs, j));
+            }
+            done[j] = true;
+            left -= 1;
+            progress = true;
+        }
+        if !progress {
+            // Everything left is part of a cycle: save one destination and
+            // let its readers use the copy.
+            let j = 0;
+            while done[j] { j += 1; }
+            let t = fresh_vreg(s);
+            out(s, mi(M_MOV, t, at(dsts, j)));
+            for q in 0..dsts.len {
+                if !done[q] && at(src_regs, q) == at(dsts, j) { set(src_regs, q, t); }
+            }
+        }
+    }
+}
+
+fn sel_call(s: Isel, id: int, i: Inst) {
+    let first = if i.op == OP_CALLIND { 1 } else { 0 };
+    let callee = if first == 1 { reg(s, at(i.args, 0)) } else { -1 };
+    for k in first..i.args.len { move_to(s, arg_reg(k - first), at(i.args, k)); }
+    let m = if first == 1 { mi(M_CALLR, callee, -1) } else { mi_imm(M_CALL, -1, i.imm) };
+    m.x = i.args.len - first;
+    out(s, m);
+    if s.need[id] > 0 { out(s, mi(M_MOV, vreg_of(s, id), RAX)); }
+}
+
+fn sel(s: Isel, b: int, id: int) {
+    let i = at(s.f.insts, id);
+    let op = i.op;
+    if op <= OP_PHI { return; }
+    if !has_effect(op) && s.need[id] == 0 { return; }
+    if is_binary(op) {
+        sel_binary(s, id, i);
+    } else if op == OP_NEG || op == OP_NOT {
+        let d = vreg_of(s, id);
+        out(s, mi(M_MOV, d, reg(s, at(i.args, 0))));
+        if op == OP_NEG { out(s, mi(M_NEG, d, -1)); } else { out(s, mi_imm(M_XORI, d, 1)); }
+    } else if op >= OP_LOAD && op <= OP_LOAD8C {
+        addr(s, at(i.args, 0), i.imm);
+        out(s, mem(s, if op == OP_LOAD || op == OP_LOADC { M_LOAD } else { M_LOAD8 }, vreg_of(s, id)));
+    } else if op == OP_STORE || op == OP_STORE8 {
+        let v = at(i.args, 1);
+        if op == OP_STORE && is_imm(s, v) {
+            addr(s, at(i.args, 0), i.imm);
+            out(s, mem(s, M_STOREI, imm_of(s, v)));
+        } else {
+            let rv = reg(s, v);
+            addr(s, at(i.args, 0), i.imm);
+            out(s, mem(s, if op == OP_STORE { M_STORE } else { M_STORE8 }, rv));
+        }
+    } else if op == OP_ALLOC {
+        // Bump allocation: the result is the old heap pointer.
+        let size = at(i.args, 0);
+        if is_imm(s, size) {
+            out(s, mi(M_MOV, vreg_of(s, id), R15));
+            out(s, mi_imm(M_ADDI, R15, imm_of(s, size)));
+        } else {
+            let rs = reg(s, size);
+            out(s, mi(M_MOV, vreg_of(s, id), R15));
+            out(s, mi(M_ADD, R15, rs));
+        }
+    } else if op == OP_CALL || op == OP_CALLIND {
+        sel_call(s, id, i);
+    } else if op == OP_SYSCALL {
+        move_to(s, RAX, at(i.args, 0));
+        move_to(s, RDI, at(i.args, 1));
+        move_to(s, RSI, at(i.args, 2));
+        move_to(s, RDX, at(i.args, 3));
+        out(s, mi(M_SYSCALL, -1, -1));
+        if s.need[id] > 0 { out(s, mi(M_MOV, vreg_of(s, id), RAX)); }
+    } else if op == OP_JMP {
+        sel_phi_moves(s, b, i.imm);
+        out(s, mi_imm(M_JMP, -1, i.imm));
+    } else if op == OP_BR {
+        let c = at(i.args, 0);
+        let ci = at(s.f.insts, c);
+        let cc = CC_NE;
+        if ci.op >= OP_EQ && ci.op <= OP_GE {
+            // Compare and branch on the flags directly.
+            s.need[c] = s.need[c] - 1;
+            cc = sel_cmp(s, ci.op, at(ci.args, 0), at(ci.args, 1));
+        } else {
+            let rc = reg(s, c);
+            out(s, mi(M_TEST, rc, rc));
+        }
+        let m = mi_imm(M_JCC, -1, i.imm);
+        m.x = cc;
+        out(s, m);
+        out(s, mi_imm(M_JMP, -1, i.aux));
+    } else if op == OP_RET {
+        move_to(s, RAX, at(i.args, 0));
+        out(s, mi(M_RET, -1, -1));
+    }
+}
+
+fn isel(m: Module, f: Func) -> MFunc {
+    split_critical_edges(f);
+    let depth = loop_depths(f);
+    let order = rpo(f);
+    let mf = MFunc {
+        name: f.name, index: f.index, blocks: vec_new(), order: order,
+        nvreg: NREGS, nospill: vec_fill(NREGS, false), nslots: 0, spills: 0
+    };
+    let s = Isel {
+        m: m, f: f, mf: mf,
+        need: array_new(f.insts.len, 0),
+        vreg: array_new(f.insts.len, -1),
+        seq: vec_new(),
+        am_base: 0, am_idx: -1, am_scale: 0, am_disp: 0
+    };
+    for b in 0..f.blocks.len {
+        let blk = at(f.blocks, b);
+        let next = vec_new();
+        succs(f, b, next);
+        push(mf.blocks, MBlock { code: vec_new(), next: next, depth: depth[b] });
+        for k in 0..blk.insts.len {
+            let i = at(f.insts, at(blk.insts, k));
+            for j in 0..i.args.len { s.need[at(i.args, j)] = s.need[at(i.args, j)] + 1; }
+        }
+    }
+    let n = order.len;
+    for oi in 0..n {
+        let b = at(order, n - 1 - oi);
+        let blk = at(f.blocks, b);
+        let rev = vec_new();
+        for k in 0..blk.insts.len {
+            s.seq = vec_new();
+            sel(s, b, at(blk.insts, blk.insts.len - 1 - k));
+            for j in 0..s.seq.len { push(rev, at(s.seq, s.seq.len - 1 - j)); }
+        }
+        if b == 0 {
+            // Parameters arrive in the argument registers.
+            for k in 0..blk.insts.len {
+                let id = at(blk.insts, k);
+                let i = at(f.insts, id);
+                if i.op == OP_PARAM && s.need[id] > 0 {
+                    push(rev, mi(M_MOV, vreg_of(s, id), arg_reg(i.imm)));
+                }
+            }
+        }
+        vec_reverse(rev);
+        at(mf.blocks, b).code = rev;
+    }
+    mf
+}
