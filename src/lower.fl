@@ -509,14 +509,18 @@ fn lower_stmt(l: Lower, s: Stmt) {
         SFor(name, lo, hi, body) => {
             let vlo = lower(l, lo, true);
             let vhi = lower(l, hi, true);
-            let mark = l.names.len;
-            let slot = declare(l, name);
-            write_var(l, slot, l.cur, vlo);
+            // The counter is hidden. The name the body sees is a fresh
+            // binding each time round, so assigning to it cannot change how
+            // often the loop runs.
+            let counter = temp_slot(l);
+            write_var(l, counter, l.cur, vlo);
             let head = lb_new(l);
             let latch = lb_new(l);
             let exit_b = lb_new(l);
             branch(l, emit(l, OP_LT, args2(vlo, vhi), 0), head, exit_b);
             switch_to(l, head);
+            let mark = l.names.len;
+            write_var(l, declare(l, name), l.cur, read_var(l, counter, l.cur));
             push(l.breaks, exit_b);
             push(l.conts, latch);
             lower(l, body, false);
@@ -525,8 +529,8 @@ fn lower_stmt(l: Lower, s: Stmt) {
             jump(l, latch);
             seal(l, latch);
             switch_to(l, latch);
-            let next = emit(l, OP_ADD, args2(read_var(l, slot, l.cur), konst(l, 1)), 0);
-            write_var(l, slot, l.cur, next);
+            let next = emit(l, OP_ADD, args2(read_var(l, counter, l.cur), konst(l, 1)), 0);
+            write_var(l, counter, l.cur, next);
             branch(l, emit(l, OP_LT, args2(next, vhi), 0), head, exit_b);
             seal(l, head);
             seal(l, exit_b);

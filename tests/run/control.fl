@@ -95,4 +95,28 @@ fn main() {
         outer * 2
     };
     println(int_to_str(r + outer));
+    println(int_to_str(loop_var_is_fresh()));
+    println(int_to_str(bounds_evaluated_once()));
+}
+
+// The loop variable is a fresh binding on every iteration: assigning to it
+// does not change how many times the loop runs.
+fn loop_var_is_fresh() -> int {
+    let seen = 0;
+    for i in 0..5 {
+        seen = seen * 10 + i;
+        i = i + 100;
+        seen = seen + i / 100;
+    }
+    seen
+}
+
+fn bounds_evaluated_once() -> int {
+    let n = 3;
+    let trips = 0;
+    for i in 0..n {
+        n = n + 5;
+        trips += 1;
+    }
+    trips * 100 + n
 }
