@@ -9,7 +9,8 @@ struct Options {
     optimize: bool,
     linear: bool,
     dump_ir: bool,
-    stats: bool
+    stats: bool,
+    verbose: bool
 }
 
 fn usage<T>() -> T {
@@ -19,11 +20,12 @@ fn usage<T>() -> T {
     eprint("  --regalloc=linear    linear scan\n");
     eprint("  --dump-ir            print the optimised SSA to stdout\n");
     eprint("  --stats              print code size and spill counts to stderr\n");
+    eprint("  --verbose            name each function as it is compiled\n");
     exit(2)
 }
 
 fn parse_options() -> Options {
-    let o = Options { out: "", files: vec_new(), optimize: true, linear: false, dump_ir: false, stats: false };
+    let o = Options { out: "", files: vec_new(), optimize: true, linear: false, dump_ir: false, stats: false, verbose: false };
     let i = 1;
     while i < arg_count() {
         let a = arg(i);
@@ -37,6 +39,7 @@ fn parse_options() -> Options {
         else if a == "--regalloc=graph" { o.linear = false; }
         else if a == "--dump-ir" { o.dump_ir = true; }
         else if a == "--stats" { o.stats = true; }
+        else if a == "--verbose" { o.verbose = true; }
         else if starts_with(a, "-") { usage(); }
         else { push(o.files, a); }
         i += 1;
@@ -141,6 +144,10 @@ fn main() {
     for i in 0..m.funcs.len {
         if !live[i] { continue; }
         let mf = isel(m, at(m.funcs, i));
+        if o.verbose {
+            eprint(cat3(mf.name, ": ", cat3(int_to_str(mf.nvreg), " registers, heap ", int_to_str(heap_used()))));
+            eprint("\n");
+        }
         let color = if o.linear { alloc_linear(mf) } else { alloc_graph(mf) };
         apply_colors(mf, color);
         emit_func(e, mf);
@@ -155,5 +162,6 @@ fn main() {
         eprint(cat3("functions: ", int_to_str(nfuncs), "\n"));
         eprint(cat3("code bytes: ", int_to_str(code_bytes), "\n"));
         eprint(cat3("spilled registers: ", int_to_str(spills), "\n"));
+        eprint(cat3("heap bytes: ", int_to_str(heap_used()), "\n"));
     }
 }
