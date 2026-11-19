@@ -24,7 +24,7 @@ const SYS_EXIT = 231;
 // A page of writable memory at a fixed address, filled in by the startup
 // stub: word 0 is the initial stack pointer (argc and argv live there),
 // word 1 the base of the heap. Must match RT_DATA_ADDR in src/x86.fl.
-const RT_DATA = 0x10000000;
+const RT_DATA = 0x280000000;
 
 fn array_alloc<T>(n: int) -> [T] {
     let p = __alloc(8 + n * 8);

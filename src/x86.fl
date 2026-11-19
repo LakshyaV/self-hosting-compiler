@@ -7,10 +7,13 @@
 // References between functions and to strings are rip-relative, recorded as
 // fixups and patched once everything has an offset.
 
-const ELF_BASE = 0x400000;
-const ELF_HEADERS = 176;         // ELF header (64) + two program headers (56 each)
-const RT_DATA_ADDR = 0x10000000; // must match RT_DATA in lib/rt.fl
-const HEAP_SIZE = 0x1000000000;  // 64 GiB of address space, committed on touch
+// Load addresses. Nothing requires the traditional 0x400000, and staying out
+// of the low gigabyte keeps the image clear of whatever an emulator such as
+// qemu-user has mapped there for itself.
+const ELF_BASE = 0x200000000;
+const ELF_HEADERS = 176;          // ELF header (64) + two program headers (56 each)
+const RT_DATA_ADDR = 0x280000000; // must match RT_DATA in lib/rt.fl
+const HEAP_SIZE = 0x400000000;    // 16 GiB of address space, committed on touch
 
 struct Emitter {
     code: Vec<int>,
