@@ -21,8 +21,10 @@ const SYS_OPEN = 2;
 const SYS_CLOSE = 3;
 const SYS_EXIT = 231;
 
-// The startup stub saves the initial stack pointer in the first heap word.
-const HEAP_BASE = 0x1000000000;
+// A page of writable memory at a fixed address, filled in by the startup
+// stub: word 0 is the initial stack pointer (argc and argv live there),
+// word 1 the base of the heap. Must match RT_DATA_ADDR in src/x86.fl.
+const RT_DATA = 0x280000000;
 
 fn array_alloc<T>(n: int) -> [T] {
     let p = __alloc(8 + n * 8);
@@ -142,13 +144,20 @@ fn write_file(path: string, data: string, mode: int) {
     __syscall(SYS_CLOSE, fd, 0, 0);
 }
 
+// Bytes handed out by the allocator so far.
+fn heap_used() -> int {
+    let top: int = __alloc(0);
+    let base: int = __load64(RT_DATA, 8);
+    top - base
+}
+
 fn arg_count() -> int {
-    let sp: int = __load64(HEAP_BASE, 0);
+    let sp: int = __load64(RT_DATA, 0);
     __load64(sp, 0)
 }
 
 fn arg(i: int) -> string {
-    let sp: int = __load64(HEAP_BASE, 0);
+    let sp: int = __load64(RT_DATA, 0);
     let cs: int = __load64(sp, 8 + i * 8);
     let n = 0;
     while __load8(cs, n) != 0 { n = n + 1; }

@@ -1,15 +1,19 @@
 // x86-64 machine code and the ELF executable around it.
 //
 // Instructions are encoded straight to bytes; there is no assembler and no
-// linker. The output is a static, position-dependent ELF64 executable with a
-// single loadable segment holding the headers, the code and the string
-// constants. References between functions and to strings are rip-relative,
-// recorded as fixups and patched once everything has an offset.
+// linker. The output is a static, position-dependent ELF64 executable with
+// two loadable segments: one read+execute holding the headers, the code and
+// the string constants, and one zero-filled writable page for the runtime.
+// References between functions and to strings are rip-relative, recorded as
+// fixups and patched once everything has an offset.
 
-const ELF_BASE = 0x400000;
-const ELF_HEADERS = 120;        // ELF header (64) + one program header (56)
-const HEAP_ADDR = 0x1000000000; // must match HEAP_BASE in lib/rt.fl
-const HEAP_SIZE = 0x1000000000; // 64 GiB of address space, committed on touch
+// Load addresses. Nothing requires the traditional 0x400000, and staying out
+// of the low gigabyte keeps the image clear of whatever an emulator such as
+// qemu-user has mapped there for itself.
+const ELF_BASE = 0x200000000;
+const ELF_HEADERS = 176;          // ELF header (64) + two program headers (56 each)
+const RT_DATA_ADDR = 0x280000000; // must match RT_DATA in lib/rt.fl
+const HEAP_SIZE = 0x400000000;    // 16 GiB of address space, committed on touch
 
 struct Emitter {
     code: Vec<int>,
@@ -303,20 +307,30 @@ fn emit_func(e: Emitter, mf: MFunc) {
     }
 }
 
-// Process entry point: reserve the heap, remember the initial stack pointer
-// (argc/argv live there), run main, exit.
+// Process entry point: reserve the heap, record the initial stack pointer and
+// the heap base for the runtime, run main, exit.
 fn emit_start(e: Emitter, main_index: int) {
     encode(e, mi_imm(M_MOVI, RAX, 9));               // mmap
-    encode(e, mi_imm(M_MOVI, RDI, HEAP_ADDR));
+    encode(e, mi_imm(M_MOVI, RDI, 0));               // anywhere
     encode(e, mi_imm(M_MOVI, RSI, HEAP_SIZE));
     encode(e, mi_imm(M_MOVI, RDX, 3));               // PROT_READ | PROT_WRITE
-    encode(e, mi_imm(M_MOVI, R10, 0x4032));          // PRIVATE | FIXED | ANONYMOUS | NORESERVE
+    encode(e, mi_imm(M_MOVI, R10, 0x4022));          // PRIVATE | ANONYMOUS | NORESERVE
     encode(e, mi_imm(M_MOVI, R8, -1));
     encode(e, mi_imm(M_MOVI, R9, 0));
     encode(e, mi(M_SYSCALL, -1, -1));
+    // A negative result is an errno: give up with a recognisable status.
+    encode(e, mi(M_TEST, RAX, RAX));
+    e8(e, 0x79);                                     // jns over the exit
+    e8(e, 0);
+    let skip = e.code.len;
+    encode(e, mi_imm(M_MOVI, RDI, 111));
+    encode(e, mi_imm(M_MOVI, RAX, 231));
+    encode(e, mi(M_SYSCALL, -1, -1));
+    set(e.code, skip - 1, e.code.len - skip);
     encode(e, mi(M_MOV, R15, RAX));
-    encode(e, MInst { op: M_STORE, a: RSP, b: R15, c: -1, x: 0, imm: 0 });
-    encode(e, mi_imm(M_ADDI, R15, 16));
+    encode(e, mi_imm(M_MOVI, RCX, RT_DATA_ADDR));
+    encode(e, MInst { op: M_STORE, a: RSP, b: RCX, c: -1, x: 0, imm: 0 });
+    encode(e, MInst { op: M_STORE, a: R15, b: RCX, c: -1, x: 0, imm: 8 });
     encode(e, mi_imm(M_CALL, -1, main_index));
     encode(e, mi_imm(M_MOVI, RDI, 0));
     encode(e, mi_imm(M_MOVI, RAX, 231));             // exit_group
@@ -372,12 +386,12 @@ fn elf_image(e: Emitter) -> string {
     e8(h, 0);
     e8(h, 56);                   // e_phentsize
     e8(h, 0);
-    e8(h, 1);                    // e_phnum
+    e8(h, 2);                    // e_phnum
     e8(h, 0);
     e8(h, 64);                   // e_shentsize
     e8(h, 0);
     e32(h, 0);                   // e_shnum, e_shstrndx
-    // Program header: one segment, read + execute
+    // Program header 1: the whole file, read + execute
     e32(h, 1);                   // PT_LOAD
     e32(h, 5);                   // PF_R | PF_X
     e64(h, 0);                   // p_offset
@@ -385,6 +399,15 @@ fn elf_image(e: Emitter) -> string {
     e64(h, ELF_BASE);            // p_paddr
     e64(h, size);                // p_filesz
     e64(h, size);                // p_memsz
+    e64(h, 0x1000);              // p_align
+    // Program header 2: one zero page for the runtime, read + write
+    e32(h, 1);                   // PT_LOAD
+    e32(h, 6);                   // PF_R | PF_W
+    e64(h, 0);                   // p_offset
+    e64(h, RT_DATA_ADDR);        // p_vaddr
+    e64(h, RT_DATA_ADDR);        // p_paddr
+    e64(h, 0);                   // p_filesz
+    e64(h, 0x1000);              // p_memsz
     e64(h, 0x1000);              // p_align
     for k in 0..e.code.len { push(h.code, at(e.code, k)); }
     str_from_array(h.code.data, h.code.len)
