@@ -1,0 +1,440 @@
+// Graph-colouring register allocation with coalescing: iterated register
+// coalescing, after George & Appel (1996).
+//
+// Nodes are registers; an edge joins two that are live at the same time and
+// so cannot share a physical register. Colouring the graph with the 14
+// allocatable registers is the allocation. The phases interleave:
+//
+//   simplify   remove a node of degree < K that no move cares about; it can
+//              always be coloured once its neighbours are
+//   coalesce   merge the two ends of a move when that provably keeps the
+//              graph colourable (Briggs's test, or George's against a
+//              physical register), deleting the move
+//   freeze     give up coalescing the moves of some low-degree node so it
+//              can be simplified
+//   spill      pick a high-degree node as a spill candidate and carry on
+//              optimistically
+//   select     pop the nodes back, giving each a colour its neighbours lack
+//
+// Nodes that find no colour are rewritten to live in stack slots and the
+// whole thing runs again.
+
+const N_PRE = 0;        // physical register
+const N_INITIAL = 1;
+const N_SIMPLIFY = 2;   // low degree, not move related
+const N_FREEZE = 3;     // low degree, move related
+const N_SPILL = 4;      // high degree
+const N_SPILLED = 5;
+const N_COALESCED = 6;
+const N_COLORED = 7;
+const N_STACK = 8;      // removed from the graph, waiting for a colour
+
+const MV_WORK = 0;      // candidate for coalescing
+const MV_ACTIVE = 1;    // not coalescable yet
+const MV_DONE = 2;      // coalesced, constrained or frozen
+
+struct Sparse { dense: [int], where: [int], n: int }
+
+fn sparse_add(s: Sparse, v: int) {
+    if s.where[v] < 0 {
+        s.where[v] = s.n;
+        s.dense[s.n] = v;
+        s.n = s.n + 1;
+    }
+}
+
+fn sparse_del(s: Sparse, v: int) {
+    let p = s.where[v];
+    if p >= 0 {
+        let moved = s.dense[s.n - 1];
+        s.dense[p] = moved;
+        s.where[moved] = p;
+        s.where[v] = -1;
+        s.n = s.n - 1;
+    }
+}
+
+struct Irc {
+    mf: MFunc,
+    n: int,
+    edges: IntSet,
+    adj: Vec<Vec<int>>,
+    degree: [int],
+    moves_of: Vec<Vec<int>>,
+    mv_dst: Vec<int>,
+    mv_src: Vec<int>,
+    mv_state: Vec<int>,
+    alias: [int],
+    color: [int],
+    state: [int],
+    cost: [int],
+    simplify_wl: Vec<int>,
+    freeze_wl: Vec<int>,
+    spill_wl: Vec<int>,
+    n_simplify: int,
+    n_freeze: int,
+    n_spill: int,
+    move_wl: Vec<int>,
+    stack: Vec<int>,
+    spilled: Vec<int>,
+    mark: [int],
+    stamp: int
+}
+
+fn is_node(r: int) -> bool { r != RSP && r != R15 }
+
+fn edge_key(g: Irc, u: int, v: int) -> int {
+    if u < v { u * g.n + v } else { v * g.n + u }
+}
+
+fn add_edge(g: Irc, u: int, v: int) {
+    if u == v || !iset_add(g.edges, edge_key(g, u, v)) { return; }
+    if u >= NREGS {
+        push(at(g.adj, u), v);
+        g.degree[u] = g.degree[u] + 1;
+    }
+    if v >= NREGS {
+        push(at(g.adj, v), u);
+        g.degree[v] = g.degree[v] + 1;
+    }
+}
+
+// Worklists are plain vectors with lazy deletion: a node's `state` says which
+// list it is really on, and stale entries are skipped when popped.
+fn set_state(g: Irc, v: int, st: int) {
+    let old = g.state[v];
+    if old == N_SIMPLIFY { g.n_simplify = g.n_simplify - 1; }
+    else if old == N_FREEZE { g.n_freeze = g.n_freeze - 1; }
+    else if old == N_SPILL { g.n_spill = g.n_spill - 1; }
+    g.state[v] = st;
+    if st == N_SIMPLIFY {
+        g.n_simplify = g.n_simplify + 1;
+        push(g.simplify_wl, v);
+    } else if st == N_FREEZE {
+        g.n_freeze = g.n_freeze + 1;
+        push(g.freeze_wl, v);
+    } else if st == N_SPILL {
+        g.n_spill = g.n_spill + 1;
+        push(g.spill_wl, v);
+    }
+}
+
+fn in_graph(g: Irc, v: int) -> bool {
+    g.state[v] != N_STACK && g.state[v] != N_COALESCED
+}
+
+fn get_alias(g: Irc, v: int) -> int {
+    while g.state[v] == N_COALESCED { v = g.alias[v]; }
+    v
+}
+
+fn move_related(g: Irc, v: int) -> bool {
+    let ms = at(g.moves_of, v);
+    for k in 0..ms.len {
+        if at(g.mv_state, at(ms, k)) != MV_DONE { return true; }
+    }
+    false
+}
+
+fn weight(depth: int) -> int {
+    if depth == 0 { 1 } else if depth == 1 { 10 } else if depth == 2 { 100 } else { 1000 }
+}
+
+// Build the interference graph and the move lists from liveness.
+fn irc_build(g: Irc, lv: Live) {
+    let mf = g.mf;
+    let live = Sparse { dense: array_new(g.n, 0), where: array_new(g.n, -1), n: 0 };
+    let uses = vec_new();
+    let defs = vec_new();
+    let regs = vec_new();
+    for b in 0..mf.blocks.len {
+        let blk = at(mf.blocks, b);
+        let w = weight(blk.depth);
+        for k in 0..live.n { live.where[live.dense[k]] = -1; }
+        live.n = 0;
+        bits_list(at(lv.outs, b), lv.words, regs);
+        for k in 0..regs.len { sparse_add(live, at(regs, k)); }
+        for k in 0..blk.code.len {
+            let m = at(blk.code, blk.code.len - 1 - k);
+            m_uses(m, uses);
+            m_defs(m, defs);
+            if m.op == M_MOV && m.a != m.b && is_node(m.a) && is_node(m.b) {
+                // The two ends of a move do not interfere merely because of
+                // the move, and they are candidates for coalescing.
+                sparse_del(live, m.b);
+                let id = g.mv_dst.len;
+                push(g.mv_dst, m.a);
+                push(g.mv_src, m.b);
+                push(g.mv_state, MV_WORK);
+                push(at(g.moves_of, m.a), id);
+                push(at(g.moves_of, m.b), id);
+                push(g.move_wl, id);
+            }
+            for j in 0..defs.len { sparse_add(live, at(defs, j)); }
+            for j in 0..defs.len {
+                let dreg = at(defs, j);
+                for q in 0..live.n { add_edge(g, live.dense[q], dreg); }
+                g.cost[dreg] = g.cost[dreg] + w;
+            }
+            for j in 0..defs.len { sparse_del(live, at(defs, j)); }
+            for j in 0..uses.len {
+                sparse_add(live, at(uses, j));
+                g.cost[at(uses, j)] = g.cost[at(uses, j)] + w;
+            }
+        }
+    }
+}
+
+fn enable_moves(g: Irc, v: int) {
+    let ms = at(g.moves_of, v);
+    for k in 0..ms.len {
+        let m = at(ms, k);
+        if at(g.mv_state, m) == MV_ACTIVE {
+            set(g.mv_state, m, MV_WORK);
+            push(g.move_wl, m);
+        }
+    }
+}
+
+fn decrement_degree(g: Irc, v: int) {
+    if v < NREGS { return; }
+    let d = g.degree[v];
+    g.degree[v] = d - 1;
+    if d == NCOLORS && g.state[v] == N_SPILL {
+        // Just became low degree: its moves, and its neighbours', may now
+        // pass the conservative test.
+        enable_moves(g, v);
+        let ns = at(g.adj, v);
+        for k in 0..ns.len {
+            if in_graph(g, at(ns, k)) { enable_moves(g, at(ns, k)); }
+        }
+        set_state(g, v, if move_related(g, v) { N_FREEZE } else { N_SIMPLIFY });
+    }
+}
+
+fn simplify_one(g: Irc) {
+    let v = pop(g.simplify_wl);
+    if g.state[v] != N_SIMPLIFY { return; }
+    set_state(g, v, N_STACK);
+    push(g.stack, v);
+    let ns = at(g.adj, v);
+    for k in 0..ns.len {
+        if in_graph(g, at(ns, k)) { decrement_degree(g, at(ns, k)); }
+    }
+}
+
+fn add_worklist(g: Irc, u: int) {
+    if u >= NREGS && g.state[u] == N_FREEZE && !move_related(g, u) && g.degree[u] < NCOLORS {
+        set_state(g, u, N_SIMPLIFY);
+    }
+}
+
+// George's test: v can merge into physical register u if every neighbour of
+// v already conflicts with u or is trivially colourable.
+fn george_ok(g: Irc, u: int, v: int) -> bool {
+    let ns = at(g.adj, v);
+    for k in 0..ns.len {
+        let t = at(ns, k);
+        if !in_graph(g, t) { continue; }
+        if !(t < NREGS || g.degree[t] < NCOLORS || iset_has(g.edges, edge_key(g, t, u))) { return false; }
+    }
+    true
+}
+
+// Briggs's test: the merged node is safe if fewer than K of its neighbours
+// are of significant degree.
+fn briggs_ok(g: Irc, u: int, v: int) -> bool {
+    g.stamp = g.stamp + 1;
+    let heavy = 0;
+    let ns = at(g.adj, u);
+    for k in 0..ns.len {
+        let t = at(ns, k);
+        if !in_graph(g, t) { continue; }
+        g.mark[t] = g.stamp;
+        if t < NREGS || g.degree[t] >= NCOLORS { heavy += 1; }
+    }
+    ns = at(g.adj, v);
+    for k in 0..ns.len {
+        let t = at(ns, k);
+        if !in_graph(g, t) || g.mark[t] == g.stamp { continue; }
+        if t < NREGS || g.degree[t] >= NCOLORS { heavy += 1; }
+    }
+    heavy < NCOLORS
+}
+
+fn combine(g: Irc, u: int, v: int) {
+    set_state(g, v, N_COALESCED);
+    g.alias[v] = u;
+    let ms = at(g.moves_of, v);
+    for k in 0..ms.len { push(at(g.moves_of, u), at(ms, k)); }
+    enable_moves(g, v);
+    g.cost[u] = g.cost[u] + g.cost[v];
+    let ns = at(g.adj, v);
+    for k in 0..ns.len {
+        let t = at(ns, k);
+        if in_graph(g, t) {
+            add_edge(g, t, u);
+            decrement_degree(g, t);
+        }
+    }
+    if u >= NREGS && g.degree[u] >= NCOLORS && g.state[u] == N_FREEZE {
+        set_state(g, u, N_SPILL);
+    }
+}
+
+fn coalesce_one(g: Irc) {
+    let m = pop(g.move_wl);
+    if at(g.mv_state, m) != MV_WORK { return; }
+    let x = get_alias(g, at(g.mv_dst, m));
+    let y = get_alias(g, at(g.mv_src, m));
+    let u = if y < NREGS { y } else { x };
+    let v = if y < NREGS { x } else { y };
+    if u == v {
+        set(g.mv_state, m, MV_DONE);
+        add_worklist(g, u);
+    } else if v < NREGS || iset_has(g.edges, edge_key(g, u, v)) {
+        // Both physical, or they interfere: this move can never go away.
+        set(g.mv_state, m, MV_DONE);
+        add_worklist(g, u);
+        add_worklist(g, v);
+    } else if (u < NREGS && george_ok(g, u, v)) || (u >= NREGS && briggs_ok(g, u, v)) {
+        set(g.mv_state, m, MV_DONE);
+        combine(g, u, v);
+        add_worklist(g, u);
+    } else {
+        set(g.mv_state, m, MV_ACTIVE);
+    }
+}
+
+// Stop trying to coalesce the moves of `u`.
+fn freeze_moves(g: Irc, u: int) {
+    let ms = at(g.moves_of, u);
+    for k in 0..ms.len {
+        let m = at(ms, k);
+        if at(g.mv_state, m) == MV_DONE { continue; }
+        set(g.mv_state, m, MV_DONE);
+        let x = get_alias(g, at(g.mv_dst, m));
+        let y = get_alias(g, at(g.mv_src, m));
+        add_worklist(g, if y == get_alias(g, u) { x } else { y });
+    }
+}
+
+fn freeze_one(g: Irc) {
+    let u = pop(g.freeze_wl);
+    if g.state[u] != N_FREEZE { return; }
+    set_state(g, u, N_SIMPLIFY);
+    freeze_moves(g, u);
+}
+
+// Choose a spill candidate: cheapest to keep in memory relative to how many
+// neighbours it would unblock. Registers made by an earlier spill come last.
+fn select_spill(g: Irc) {
+    let best = -1;
+    let live = vec_new();
+    g.stamp = g.stamp + 1;
+    for k in 0..g.spill_wl.len {
+        let v = at(g.spill_wl, k);
+        if g.state[v] != N_SPILL || g.mark[v] == g.stamp { continue; }
+        g.mark[v] = g.stamp;
+        push(live, v);
+        if best < 0 {
+            best = v;
+            continue;
+        }
+        let v_temp = at(g.mf.nospill, v);
+        let best_temp = at(g.mf.nospill, best);
+        if v_temp != best_temp {
+            if best_temp { best = v; }
+        } else if g.cost[v] * g.degree[best] < g.cost[best] * g.degree[v] {
+            best = v;
+        }
+    }
+    g.spill_wl = live;
+    set_state(g, best, N_SIMPLIFY);
+    freeze_moves(g, best);
+}
+
+fn assign_colors(g: Irc) {
+    let used = array_new(NREGS, false);
+    while g.stack.len > 0 {
+        let v = pop(g.stack);
+        for r in 0..NREGS { used[r] = false; }
+        let ns = at(g.adj, v);
+        for k in 0..ns.len {
+            let a = get_alias(g, at(ns, k));
+            if a < NREGS || g.state[a] == N_COLORED { used[g.color[a]] = true; }
+        }
+        let got = -1;
+        for p in 0..NCOLORS {
+            if got < 0 && !used[pref_reg(p)] { got = pref_reg(p); }
+        }
+        if got < 0 {
+            if at(g.mf.nospill, v) { alloc_fail(g.mf); }
+            g.state[v] = N_SPILLED;
+            push(g.spilled, v);
+        } else {
+            g.state[v] = N_COLORED;
+            g.color[v] = got;
+        }
+    }
+    for v in NREGS..g.n {
+        if g.state[v] != N_COALESCED { continue; }
+        let a = get_alias(g, v);
+        if g.state[a] == N_SPILLED { push(g.spilled, v); } else { g.color[v] = g.color[a]; }
+    }
+}
+
+fn irc_round(mf: MFunc) -> Irc {
+    let n = mf.nvreg;
+    let g = Irc {
+        mf: mf, n: n,
+        edges: iset_new(1024),
+        adj: vec_new(),
+        degree: array_new(n, 0),
+        moves_of: vec_new(),
+        mv_dst: vec_new(), mv_src: vec_new(), mv_state: vec_new(),
+        alias: array_new(n, -1),
+        color: array_new(n, -1),
+        state: array_new(n, N_INITIAL),
+        cost: array_new(n, 0),
+        simplify_wl: vec_new(), freeze_wl: vec_new(), spill_wl: vec_new(),
+        n_simplify: 0, n_freeze: 0, n_spill: 0,
+        move_wl: vec_new(),
+        stack: vec_new(),
+        spilled: vec_new(),
+        mark: array_new(n, 0),
+        stamp: 0
+    };
+    for v in 0..n {
+        push(g.adj, vec_new());
+        push(g.moves_of, vec_new());
+    }
+    for r in 0..NREGS {
+        g.state[r] = N_PRE;
+        g.color[r] = r;
+    }
+    irc_build(g, liveness(mf));
+    for v in NREGS..n {
+        if g.degree[v] >= NCOLORS { set_state(g, v, N_SPILL); }
+        else if move_related(g, v) { set_state(g, v, N_FREEZE); }
+        else { set_state(g, v, N_SIMPLIFY); }
+    }
+    while true {
+        if g.n_simplify > 0 { simplify_one(g); }
+        else if g.move_wl.len > 0 { coalesce_one(g); }
+        else if g.n_freeze > 0 { freeze_one(g); }
+        else if g.n_spill > 0 { select_spill(g); }
+        else { break; }
+    }
+    assign_colors(g);
+    g
+}
+
+fn alloc_graph(mf: MFunc) -> [int] {
+    while true {
+        let g = irc_round(mf);
+        if g.spilled.len == 0 { return g.color; }
+        rewrite_spills(mf, g.spilled);
+    }
+    array_new(0, 0)
+}
