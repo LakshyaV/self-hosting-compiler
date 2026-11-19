@@ -1,0 +1,10 @@
+#!/bin/sh
+# Run a command on x86-64 Linux.
+#
+# Flint emits x86-64 Linux executables. On such a host this just runs the
+# command; anywhere else (macOS, arm64) it runs it in a container with the
+# repository mounted, which needs Docker and its amd64 emulation.
+if [ "$(uname -sm)" = "Linux x86_64" ]; then
+    exec "$@"
+fi
+exec docker run --rm --platform linux/amd64 -v "$PWD":/work -w /work alpine:3.20 "$@"
