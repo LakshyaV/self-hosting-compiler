@@ -1,0 +1,1 @@
+tests/fail/not_exhaustive.fl:4: error: match is not exhaustive; add the missing constructors or a '_' arm

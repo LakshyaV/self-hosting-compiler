@@ -1,0 +1,5 @@
+fn pretend<T>(x: T) -> T { x + 1 }
+
+fn main() {
+    pretend(1);
+}

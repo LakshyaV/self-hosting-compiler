@@ -1,0 +1,1 @@
+tests/fail/rigid.fl:1: error: type mismatch: expected int, found T

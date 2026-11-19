@@ -1,0 +1,1 @@
+tests/fail/unknown_ctor.fl:2: error: unknown constructor 'Nothing'

@@ -1,0 +1,1 @@
+tests/fail/too_many_params.fl:1: error: functions take at most 6 parameters

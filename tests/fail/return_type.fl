@@ -1,0 +1,8 @@
+fn f(n: int) -> int {
+    if n > 0 { return "positive"; }
+    0
+}
+
+fn main() {
+    f(1);
+}

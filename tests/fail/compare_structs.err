@@ -1,0 +1,1 @@
+tests/fail/compare_structs.fl:5: error: values of type P cannot be compared with == or !=

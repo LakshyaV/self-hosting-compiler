@@ -1,0 +1,5 @@
+fn loop_type(f) { f(f) }
+
+fn main() {
+    loop_type(loop_type);
+}

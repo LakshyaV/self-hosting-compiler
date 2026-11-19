@@ -1,0 +1,1 @@
+tests/fail/not_a_function.fl:3: error: cannot call a value of type int
