@@ -1,0 +1,158 @@
+// Structs, algebraic data types and pattern matching.
+
+struct Point { x: int, y: int }
+struct Rect { min: Point, max: Point }
+struct Pair<A, B> { first: A, second: B }
+
+type Shape = Circle(int) | Box(Rect) | Dot
+type Color = Red | Green | Blue
+type List<T> = Nil | Cons(T, List<T>)
+type Tree = Leaf | Node(Tree, int, Tree)
+type Expr = Num(int) | Add(Expr, Expr) | Mul(Expr, Expr) | Neg(Expr)
+
+fn area(s: Shape) -> int {
+    match s {
+        Circle(r) => 3 * r * r,
+        Box(b) => (b.max.x - b.min.x) * (b.max.y - b.min.y),
+        Dot => 0
+    }
+}
+
+fn color_name(c: Color) -> string {
+    match c {
+        Red => "red",
+        Green => "green",
+        Blue => "blue"
+    }
+}
+
+fn next_color(c: Color) -> Color {
+    if c == Red { Green } else if c == Green { Blue } else { Red }
+}
+
+fn length<T>(l: List<T>) -> int {
+    match l {
+        Nil => 0,
+        Cons(h, t) => 1 + length(t)
+    }
+}
+
+fn sum(l: List<int>) -> int {
+    let total = 0;
+    let cur = l;
+    let going = true;
+    while going {
+        match cur {
+            Nil => { going = false; }
+            Cons(h, t) => {
+                total += h;
+                cur = t;
+            }
+        }
+    }
+    total
+}
+
+fn insert(t: Tree, v: int) -> Tree {
+    match t {
+        Leaf => Node(Leaf, v, Leaf),
+        Node(l, x, r) => if v < x { Node(insert(l, v), x, r) } else { Node(l, x, insert(r, v)) }
+    }
+}
+
+fn walk(t: Tree, out: Vec<int>) {
+    match t {
+        Leaf => (),
+        Node(l, x, r) => {
+            walk(l, out);
+            push(out, x);
+            walk(r, out);
+        }
+    }
+}
+
+fn eval(e: Expr) -> int {
+    match e {
+        Num(n) => n,
+        Add(a, b) => eval(a) + eval(b),
+        Mul(a, b) => eval(a) * eval(b),
+        Neg(a) => 0 - eval(a)
+    }
+}
+
+fn describe(n: int) -> string {
+    match n {
+        0 => "zero",
+        1 => "one",
+        -1 => "minus one",
+        _ => "many"
+    }
+}
+
+fn swap<A, B>(p: Pair<A, B>) -> Pair<B, A> {
+    Pair { first: p.second, second: p.first }
+}
+
+fn show(n: int) { println(int_to_str(n)); }
+
+fn main() {
+    let p = Point { x: 3, y: 4 };
+    p.x = p.x + 10;
+    let r = Rect { min: Point { x: 0, y: 0 }, max: p };
+    r.max.y = 5;
+    show(p.y);
+    show(area(Box(r)));
+    show(area(Circle(2)));
+    show(area(Dot));
+
+    let c = Red;
+    for i in 0..4 {
+        print(color_name(c));
+        print(" ");
+        c = next_color(c);
+    }
+    println("");
+
+    let l = Cons(1, Cons(2, Cons(3, Nil)));
+    show(length(l));
+    show(sum(l));
+    show(length(Cons("a", Cons("b", Nil))));
+
+    let t = Leaf;
+    let keys = vec_new();
+    push(keys, 50); push(keys, 20); push(keys, 70); push(keys, 10); push(keys, 60); push(keys, 30);
+    for i in 0..keys.len { t = insert(t, at(keys, i)); }
+    let sorted = vec_new();
+    walk(t, sorted);
+    for i in 0..sorted.len {
+        print(int_to_str(at(sorted, i)));
+        print(" ");
+    }
+    println("");
+
+    show(eval(Add(Num(2), Mul(Num(3), Neg(Num(4))))));
+    println(describe(0));
+    println(describe(1));
+    println(describe(-1));
+    println(describe(99));
+
+    let q = swap(Pair { first: 1, second: "one" });
+    println(q.first);
+    show(q.second);
+
+    // a match that binds the whole value, and one that ignores fields
+    let o = Some(41);
+    let n = match o {
+        None => 0,
+        other => match other {
+            Some(_) => 1,
+            None => 2
+        }
+    };
+    show(n);
+    let m = match o {
+        Some(v) => v + 1,
+        None => -1
+    };
+    show(m);
+}

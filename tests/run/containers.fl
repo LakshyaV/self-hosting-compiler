@@ -1,0 +1,67 @@
+// The standard library's containers.
+
+fn main() {
+    let m = map_new();
+    let words = vec_new();
+    push(words, "the"); push(words, "quick"); push(words, "brown"); push(words, "fox");
+    push(words, "jumps"); push(words, "over"); push(words, "the"); push(words, "lazy");
+    push(words, "dog"); push(words, "the"); push(words, "end");
+    for i in 0..words.len {
+        let w = at(words, i);
+        let seen = match map_get(m, w) {
+            Some(n) => n,
+            None => 0
+        };
+        map_put(m, w, seen + 1);
+    }
+    println(int_to_str(m.count));
+    println(int_to_str(match map_get(m, "the") { Some(n) => n, None => 0 }));
+    println(if map_has(m, "fox") { "has fox" } else { "no fox" });
+    println(if map_has(m, "cat") { "has cat" } else { "no cat" });
+
+    // enough keys to force several rehashes
+    let big = map_new();
+    for i in 0..500 { map_put(big, int_to_str(i * 37), i); }
+    let ok = true;
+    for i in 0..500 {
+        match map_get(big, int_to_str(i * 37)) {
+            Some(v) => { if v != i { ok = false; } }
+            None => { ok = false; }
+        }
+    }
+    println(if ok && big.count == 500 { "map ok" } else { "map broken" });
+
+    let s = iset_new(16);
+    let added = 0;
+    for i in 0..300 {
+        if iset_add(s, (i * i) % 211) { added += 1; }
+    }
+    println(int_to_str(added));
+    println(if iset_has(s, 4) && !iset_has(s, 5000) { "set ok" } else { "set broken" });
+
+    let ids = vec_new();
+    let keys = vec_new();
+    for i in 0..12 {
+        push(ids, i);
+        push(keys, (i * 7) % 5);
+    }
+    sort_by_key(ids, keys);
+    for i in 0..ids.len {
+        print(int_to_str(at(ids, i)));
+        print(" ");
+    }
+    println("");
+
+    let bits = bits_new(100);
+    bit_set(bits, 0);
+    bit_set(bits, 31);
+    bit_set(bits, 32);
+    bit_set(bits, 99);
+    bit_clear(bits, 31);
+    let n = 0;
+    for i in 0..100 {
+        if bit_get(bits, i) { n = n * 100 + i; }
+    }
+    println(int_to_str(n));
+    println(int_to_str(min(3, -4) + max(3, -4)));
+}

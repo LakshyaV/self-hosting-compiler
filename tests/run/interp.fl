@@ -1,0 +1,134 @@
+// A larger program: a calculator with its own lexer, parser and evaluator.
+
+type Tok = TNum(int) | TOp(int) | TLParen | TRParen | TEnd
+
+type Ast = Lit(int) | Bin(int, Ast, Ast) | Minus(Ast)
+
+struct Cursor { toks: Vec<Tok>, pos: int }
+
+fn is_digit_char(c: int) -> bool { c >= '0' && c <= '9' }
+
+fn tokenize(s: string) -> Vec<Tok> {
+    let out = vec_new();
+    let i = 0;
+    let n = str_len(s);
+    while i < n {
+        let c = char_at(s, i);
+        if c == ' ' {
+            i += 1;
+        } else if is_digit_char(c) {
+            let v = 0;
+            while i < n && is_digit_char(char_at(s, i)) {
+                v = v * 10 + (char_at(s, i) - '0');
+                i += 1;
+            }
+            push(out, TNum(v));
+        } else if c == '(' {
+            push(out, TLParen);
+            i += 1;
+        } else if c == ')' {
+            push(out, TRParen);
+            i += 1;
+        } else {
+            push(out, TOp(c));
+            i += 1;
+        }
+    }
+    push(out, TEnd);
+    out
+}
+
+fn peek_op(c: Cursor) -> int {
+    match at(c.toks, c.pos) {
+        TOp(o) => o,
+        _ => 0
+    }
+}
+
+fn parse_sum(c: Cursor) -> Ast {
+    let lhs = parse_product(c);
+    while peek_op(c) == '+' || peek_op(c) == '-' {
+        let op = peek_op(c);
+        c.pos = c.pos + 1;
+        lhs = Bin(op, lhs, parse_product(c));
+    }
+    lhs
+}
+
+fn parse_product(c: Cursor) -> Ast {
+    let lhs = parse_atom(c);
+    while peek_op(c) == '*' || peek_op(c) == '/' || peek_op(c) == '%' {
+        let op = peek_op(c);
+        c.pos = c.pos + 1;
+        lhs = Bin(op, lhs, parse_atom(c));
+    }
+    lhs
+}
+
+fn parse_atom(c: Cursor) -> Ast {
+    let t = at(c.toks, c.pos);
+    c.pos = c.pos + 1;
+    match t {
+        TNum(v) => Lit(v),
+        TLParen => {
+            let e = parse_sum(c);
+            c.pos = c.pos + 1;
+            e
+        }
+        TOp(o) => Minus(parse_atom(c)),
+        _ => Lit(0)
+    }
+}
+
+fn eval(a: Ast) -> int {
+    match a {
+        Lit(v) => v,
+        Minus(x) => 0 - eval(x),
+        Bin(op, l, r) => {
+            let x = eval(l);
+            let y = eval(r);
+            if op == '+' { x + y }
+            else if op == '-' { x - y }
+            else if op == '*' { x * y }
+            else if op == '/' { x / y }
+            else { x % y }
+        }
+    }
+}
+
+fn render(a: Ast, out: Vec<int>) {
+    match a {
+        Lit(v) => sb_int(out, v),
+        Minus(x) => {
+            sb_add(out, "(-");
+            render(x, out);
+            sb_add(out, ")");
+        }
+        Bin(op, l, r) => {
+            sb_add(out, "(");
+            render(l, out);
+            push(out, ' ');
+            push(out, op);
+            push(out, ' ');
+            render(r, out);
+            sb_add(out, ")");
+        }
+    }
+}
+
+fn calc(src: string) {
+    let ast = parse_sum(Cursor { toks: tokenize(src), pos: 0 });
+    let text = vec_new();
+    render(ast, text);
+    println(cat3(sb_str(text), " = ", int_to_str(eval(ast))));
+}
+
+fn main() {
+    calc("1 + 2 * 3");
+    calc("(1 + 2) * 3");
+    calc("100 / 7 % 5 - -3");
+    calc("2 * (3 + 4) * (5 - 1)");
+    calc("-(2 + 3) * -4");
+    calc("((((7))))");
+    calc("1 - 2 - 3 - 4");
+}

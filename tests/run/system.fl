@@ -1,0 +1,21 @@
+// Talking to the outside world: arguments, files, exit status.
+
+fn main() {
+    println(int_to_str(arg_count() - 1));
+    for i in 1..arg_count() {
+        println(cat3("[", arg(i), "]"));
+    }
+    let path = "build/tests/system.tmp";
+    let text = vec_new();
+    for i in 0..2000 {
+        sb_int(text, i);
+        sb_add(text, "\n");
+    }
+    write_file(path, sb_str(text), 420);
+    let back = read_file(path);
+    println(int_to_str(str_len(back)));
+    println(if back == sb_str(text) { "round trip ok" } else { "round trip failed" });
+    eprint("this goes to stderr\n");
+    exit(3);
+    println("not reached");
+}

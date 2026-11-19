@@ -1,0 +1,67 @@
+// Strings: literals, escapes, comparison, slicing, building.
+
+fn repeat(s: string, n: int) -> string {
+    let out = "";
+    for i in 0..n { out = str_concat(out, s); }
+    out
+}
+
+fn reverse(s: string) -> string {
+    let b = vec_new();
+    let i = str_len(s) - 1;
+    while i >= 0 {
+        push(b, char_at(s, i));
+        i -= 1;
+    }
+    sb_str(b)
+}
+
+fn is_palindrome(s: string) -> bool { s == reverse(s) }
+
+fn count(s: string, c: int) -> int {
+    let n = 0;
+    for i in 0..str_len(s) {
+        if char_at(s, i) == c { n += 1; }
+    }
+    n
+}
+
+fn yes(b: bool) -> string { if b { "yes" } else { "no" } }
+
+fn main() {
+    println("hello");
+    println("tab\there, quote \" and backslash \\");
+    println("bytes: \x41\x42\x43");
+    println(int_to_str(str_len("")));
+    println(int_to_str(str_len("four")));
+    println(repeat("ab", 5));
+    println(reverse("stressed"));
+    println(yes(is_palindrome("racecar")));
+    println(yes(is_palindrome("racecars")));
+    println(yes("abc" == "abc"));
+    println(yes("abc" == "abd"));
+    println(yes("abc" != "abcd"));
+    println(yes("" == ""));
+    println(substr("hello, world", 7, 5));
+    println(int_to_str(count("mississippi", 's')));
+    println(int_to_str(0));
+    println(int_to_str(-42));
+    println(int_to_str(1000000007));
+    println(int_to_str(0 - 9223372036854775807 - 1));
+    println(yes(starts_with("flint", "fl")));
+    println(yes(starts_with("fl", "flint")));
+    let b = vec_new();
+    for i in 0..5 {
+        sb_int(b, i * i);
+        sb_add(b, ",");
+    }
+    println(sb_str(b));
+    println(cat3("<", "mid", ">"));
+    // strings of every length around the 8-byte padding boundary
+    let s = "";
+    for i in 0..18 {
+        s = str_concat(s, "x");
+        if str_len(s) != i + 1 || reverse(s) != s { println("padding bug"); }
+    }
+    println(s);
+}
