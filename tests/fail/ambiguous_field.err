@@ -1,0 +1,1 @@
+tests/fail/ambiguous_field.fl:4: error: cannot tell which struct '.size' belongs to here; add a type annotation

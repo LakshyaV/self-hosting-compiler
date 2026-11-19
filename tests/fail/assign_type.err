@@ -1,0 +1,1 @@
+tests/fail/assign_type.fl:5: error: type mismatch: expected int, found Vec<int>

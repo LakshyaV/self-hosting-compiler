@@ -1,0 +1,70 @@
+// Register pressure: more simultaneously live values than there are
+// registers, kept alive across calls, divisions and shifts.
+
+fn id(x: int) -> int { x }
+
+fn mix(a: int, b: int, c: int, d: int, e: int, f: int) -> int {
+    a - b + c - d + e - f
+}
+
+fn many(seed: int) -> int {
+    let a = id(seed + 1);
+    let b = id(seed + 2);
+    let c = id(seed + 3);
+    let d = id(seed + 4);
+    let e = id(seed + 5);
+    let f = id(seed + 6);
+    let g = id(seed + 7);
+    let h = id(seed + 8);
+    let i = id(seed + 9);
+    let j = id(seed + 10);
+    let k = id(seed + 11);
+    let l = id(seed + 12);
+    let m = id(seed + 13);
+    let n = id(seed + 14);
+    let o = id(seed + 15);
+    let p = id(seed + 16);
+    let q = id(seed + 17);
+    let r = id(seed + 18);
+    let s = id(seed + 19);
+    let t = id(seed + 20);
+    // every one of them is still needed here
+    let x = mix(a, b, c, d, e, f) + mix(g, h, i, j, k, l) + mix(m, n, o, p, q, r);
+    let y = (a * b) % (c + d) + (e << (f & 3)) + (g / (h - seed)) + (i >> (j & 1));
+    let z = k * l - m * n + o * p - q * r + s * t;
+    x + y + z + a + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p + q + r + s + t
+}
+
+fn wide(v: Vec<int>) -> int {
+    // twenty loads live at once, then combined pairwise
+    let a0 = at(v, 0); let a1 = at(v, 1); let a2 = at(v, 2); let a3 = at(v, 3);
+    let a4 = at(v, 4); let a5 = at(v, 5); let a6 = at(v, 6); let a7 = at(v, 7);
+    let a8 = at(v, 8); let a9 = at(v, 9); let b0 = at(v, 10); let b1 = at(v, 11);
+    let b2 = at(v, 12); let b3 = at(v, 13); let b4 = at(v, 14); let b5 = at(v, 15);
+    let b6 = at(v, 16); let b7 = at(v, 17); let b8 = at(v, 18); let b9 = at(v, 19);
+    let s = 0;
+    for round in 0..3 {
+        s = s + a0 * b9 + a1 * b8 + a2 * b7 + a3 * b6 + a4 * b5 + a5 * b4 + a6 * b3 + a7 * b2 + a8 * b1 + a9 * b0;
+        s = s % 1000003;
+        a0 = a0 + b0; a1 = a1 + b1; a2 = a2 + b2; a3 = a3 + b3; a4 = a4 + b4;
+        b5 = b5 - a5; b6 = b6 - a6; b7 = b7 - a7; b8 = b8 - a8; b9 = b9 - a9;
+    }
+    s + a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7 + b8 + b9
+}
+
+fn deep(n: int) -> int {
+    // a single expression that needs a lot of temporaries
+    ((n + 1) * (n + 2) + (n + 3) * (n + 4)) * ((n + 5) * (n + 6) + (n + 7) * (n + 8))
+        - ((n - 1) * (n - 2) + (n - 3) * (n - 4)) * ((n - 5) * (n - 6) + (n - 7) * (n - 8))
+        + (n / 3 + n % 7) * (n << 2) - (n >> 1) * (n / 5 + 1)
+}
+
+fn main() {
+    println(int_to_str(many(100)));
+    println(int_to_str(many(-7)));
+    let v = vec_new();
+    for i in 0..20 { push(v, i * 7 + 1); }
+    println(int_to_str(wide(v)));
+    println(int_to_str(deep(10)));
+    println(int_to_str(deep(-3)));
+}

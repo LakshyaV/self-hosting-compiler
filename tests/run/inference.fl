@@ -1,0 +1,98 @@
+// Type inference: no annotations anywhere in this file.
+
+struct Box<T> { value: T }
+struct Two<A, B> { left: A, right: B }
+
+fn id(x) { x }
+
+fn compose(f, g, x) { f(g(x)) }
+
+fn inc(n) { n + 1 }
+
+fn twice(f, x) { f(f(x)) }
+
+fn make(v) { Box { value: v } }
+
+fn unbox(b) { b.value }
+
+fn pair(a, b) { Two { left: a, right: b } }
+
+fn flip(p) { pair(p.right, p.left) }
+
+fn first_or(v, fallback) {
+    if v.len > 0 { at(v, 0) } else { fallback }
+}
+
+fn count_if(pred, v) {
+    let n = 0;
+    for i in 0..v.len {
+        if pred(at(v, i)) { n += 1; }
+    }
+    n
+}
+
+fn positive(n) { n > 0 }
+
+fn long(s) { str_len(s) > 3 }
+
+fn choose(c, a, b) { if c { a } else { b } }
+
+// mutually recursive, inferred together
+fn ping(n) { if n == 0 { "ping" } else { pong(n - 1) } }
+fn pong(n) { if n == 0 { "pong" } else { ping(n - 1) } }
+
+fn opt_map(f, o) {
+    match o {
+        Some(x) => Some(f(x)),
+        None => None
+    }
+}
+
+fn opt_or(o, d) {
+    match o {
+        Some(x) => x,
+        None => d
+    }
+}
+
+fn main() {
+    // `id` is used at three different types
+    println(int_to_str(id(7)));
+    println(id("seven"));
+    println(if id(true) { "true" } else { "false" });
+
+    println(int_to_str(compose(inc, inc, 40)));
+    println(int_to_str(twice(inc, 0)));
+    println(int_to_str(compose(str_size, id, "four")));
+
+    let a = make(5);
+    let b = make("five");
+    println(int_to_str(unbox(a)));
+    println(unbox(b));
+    a.value = a.value * 2;
+    println(int_to_str(unbox(a)));
+
+    let p = flip(pair(1, "one"));
+    println(p.left);
+    println(int_to_str(p.right));
+
+    let nums = vec_new();
+    push(nums, 3); push(nums, -1); push(nums, 4); push(nums, -1); push(nums, 5);
+    let words = vec_new();
+    push(words, "a"); push(words, "long"); push(words, "word"); push(words, "is");
+    println(int_to_str(count_if(positive, nums)));
+    println(int_to_str(count_if(long, words)));
+    println(int_to_str(first_or(nums, 0)));
+    println(first_or(vec_new(), "empty"));
+
+    println(choose(true, "left", "right"));
+    println(int_to_str(choose(false, 1, 2)));
+    println(ping(3));
+    println(ping(4));
+
+    println(int_to_str(opt_or(opt_map(inc, Some(1)), 0)));
+    println(int_to_str(opt_or(opt_map(inc, None), 0)));
+    println(opt_or(opt_map(id, Some("some")), "none"));
+}
+
+fn str_size(s) { str_len(s) }

@@ -1,0 +1,8 @@
+struct A { size: int }
+struct B { size: int }
+
+fn size_of(x) { x.size }
+
+fn main() {
+    size_of(A { size: 1 });
+}

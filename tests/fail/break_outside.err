@@ -1,0 +1,1 @@
+tests/fail/break_outside.fl:2: error: 'break' outside a loop

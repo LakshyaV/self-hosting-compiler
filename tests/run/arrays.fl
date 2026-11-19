@@ -1,0 +1,134 @@
+// Arrays and vectors.
+
+fn show_all(v: Vec<int>) {
+    for i in 0..v.len {
+        if i > 0 { print(" "); }
+        print(int_to_str(at(v, i)));
+    }
+    println("");
+}
+
+fn sieve(n: int) -> Vec<int> {
+    let composite = array_new(n + 1, false);
+    let primes = vec_new();
+    for i in 2..n + 1 {
+        if !composite[i] {
+            push(primes, i);
+            let j = i * i;
+            while j <= n {
+                composite[j] = true;
+                j += i;
+            }
+        }
+    }
+    primes
+}
+
+fn insertion_sort(a: [int]) {
+    for i in 1..len(a) {
+        let key = a[i];
+        let j = i - 1;
+        while j >= 0 && a[j] > key {
+            a[j + 1] = a[j];
+            j -= 1;
+        }
+        a[j + 1] = key;
+    }
+}
+
+fn quicksort(a: [int], lo: int, hi: int) {
+    if lo >= hi { return; }
+    let pivot = a[(lo + hi) / 2];
+    let i = lo;
+    let j = hi;
+    while i <= j {
+        while a[i] < pivot { i += 1; }
+        while a[j] > pivot { j -= 1; }
+        if i <= j {
+            let t = a[i];
+            a[i] = a[j];
+            a[j] = t;
+            i += 1;
+            j -= 1;
+        }
+    }
+    quicksort(a, lo, j);
+    quicksort(a, i, hi);
+}
+
+fn matmul(a: [[int]], b: [[int]], n: int) -> [[int]] {
+    let c = array_new(n, array_new(0, 0));
+    for i in 0..n {
+        c[i] = array_new(n, 0);
+        for j in 0..n {
+            let s = 0;
+            for k in 0..n { s += a[i][k] * b[k][j]; }
+            c[i][j] = s;
+        }
+    }
+    c
+}
+
+fn main() {
+    show_all(sieve(60));
+
+    let a = array_new(10, 0);
+    let seed = 12345;
+    for i in 0..10 {
+        seed = (seed * 1103515245 + 12345) % 2147483648;
+        a[i] = seed % 100;
+    }
+    let b = array_new(10, 0);
+    for i in 0..10 { b[i] = a[i]; }
+    insertion_sort(a);
+    quicksort(b, 0, 9);
+    let va = vec_new();
+    let same = true;
+    for i in 0..10 {
+        push(va, a[i]);
+        if a[i] != b[i] { same = false; }
+    }
+    show_all(va);
+    println(if same { "sorts agree" } else { "sorts differ" });
+
+    let n = 3;
+    let m = array_new(n, array_new(0, 0));
+    for i in 0..n {
+        m[i] = array_new(n, 0);
+        for j in 0..n { m[i][j] = i * n + j + 1; }
+    }
+    let p = matmul(m, m, n);
+    for i in 0..n {
+        let row = vec_new();
+        for j in 0..n { push(row, p[i][j]); }
+        show_all(row);
+    }
+
+    // vectors grow, shrink, copy and reverse
+    let v = vec_new();
+    for i in 0..20 { push(v, i * 3); }
+    println(int_to_str(v.len));
+    println(int_to_str(pop(v) + pop(v)));
+    println(int_to_str(last(v)));
+    set(v, 0, 99);
+    let w = vec_copy(v);
+    vec_reverse(w);
+    println(int_to_str(at(w, w.len - 1)));
+    println(int_to_str(index_of(v, 15)));
+    println(int_to_str(index_of(v, 16)));
+
+    let names = vec_new();
+    push(names, "one");
+    push(names, "two");
+    push(names, "three");
+    for i in 0..names.len { print(at(names, i)); }
+    println("");
+
+    // array of zero length, and arrays of booleans and strings
+    println(int_to_str(len(array_new(0, 0))));
+    let flags = array_new(3, true);
+    flags[1] = false;
+    println(if flags[0] && !flags[1] && flags[2] { "flags ok" } else { "flags wrong" });
+    let fresh: [int] = array_alloc(4);
+    println(int_to_str(fresh[0] + fresh[3] + len(fresh)));
+}

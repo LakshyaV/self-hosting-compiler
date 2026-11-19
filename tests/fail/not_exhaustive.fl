@@ -1,0 +1,12 @@
+type Color = Red | Green | Blue
+
+fn name(c: Color) -> string {
+    match c {
+        Red => "red",
+        Green => "green"
+    }
+}
+
+fn main() {
+    println(name(Red));
+}

@@ -1,0 +1,6 @@
+fn main() {
+    let v = vec_new();
+    push(v, 1);
+    let n = 0;
+    n = v;
+}

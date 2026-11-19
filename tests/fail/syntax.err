@@ -1,0 +1,1 @@
+tests/fail/syntax.fl:2: error: expected expression, found ';'

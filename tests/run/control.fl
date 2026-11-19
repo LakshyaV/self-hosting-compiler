@@ -1,0 +1,98 @@
+// Control flow: if chains, loops, break/continue, short-circuit evaluation.
+
+fn noisy(tag: string, v: bool) -> bool {
+    print(tag);
+    v
+}
+
+fn classify(n: int) -> string {
+    if n < 0 { "negative" }
+    else if n == 0 { "zero" }
+    else if n < 10 { "small" }
+    else { "large" }
+}
+
+fn collatz(n: int) -> int {
+    let steps = 0;
+    while n != 1 {
+        if n % 2 == 0 { n = n / 2; } else { n = 3 * n + 1; }
+        steps += 1;
+    }
+    steps
+}
+
+fn first_multiple(of: int, above: int) -> int {
+    let i = above;
+    while true {
+        i += 1;
+        if i % of == 0 { return i; }
+    }
+    -1
+}
+
+fn main() {
+    println(classify(-5));
+    println(classify(0));
+    println(classify(7));
+    println(classify(70));
+
+    // short circuit: the right side runs only when needed
+    if noisy("a", false) && noisy("b", true) { print("!"); }
+    print(" ");
+    if noisy("c", true) && noisy("d", true) { print("!"); }
+    print(" ");
+    if noisy("e", true) || noisy("f", true) { print("!"); }
+    print(" ");
+    if noisy("g", false) || noisy("h", false) { print("!"); }
+    println("");
+
+    // break and continue
+    let sum = 0;
+    for i in 0..100 {
+        if i % 2 == 0 { continue; }
+        if i > 20 { break; }
+        sum += i;
+    }
+    println(int_to_str(sum));
+
+    // continue in a while loop must still reach the condition
+    let i = 0;
+    let odd = 0;
+    while i < 10 {
+        i += 1;
+        if i % 2 == 0 { continue; }
+        odd += 1;
+    }
+    println(int_to_str(odd));
+
+    // nested loops with an early exit from the inner one
+    let pairs = 0;
+    for x in 0..6 {
+        for y in 0..6 {
+            if y > x { break; }
+            pairs += 1;
+        }
+    }
+    println(int_to_str(pairs));
+
+    // loops that run zero times
+    for z in 5..5 { println("never"); }
+    for z in 9..2 { println("never"); }
+    while false { println("never"); }
+
+    println(int_to_str(collatz(27)));
+    println(int_to_str(first_multiple(7, 100)));
+
+    // if as an expression, nested
+    let n = 15;
+    let word = if n % 15 == 0 { "fizzbuzz" } else { if n % 3 == 0 { "fizz" } else { "other" } };
+    println(word);
+
+    // blocks are expressions and open scopes
+    let outer = 1;
+    let r = {
+        let outer = 10;
+        outer * 2
+    };
+    println(int_to_str(r + outer));
+}

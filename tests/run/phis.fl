@@ -1,0 +1,87 @@
+// Values that flow around loops: swaps, rotations and other phi cycles that
+// have to be lowered as parallel copies.
+
+fn fib_iter(n: int) -> int {
+    let a = 0;
+    let b = 1;
+    for i in 0..n {
+        let t = a + b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+fn swap_n(x: int, y: int, n: int) -> int {
+    for i in 0..n {
+        let t = x;
+        x = y;
+        y = t;
+    }
+    x * 10 + y
+}
+
+fn rotate(a: int, b: int, c: int, d: int, n: int) -> int {
+    for i in 0..n {
+        let t = a;
+        a = b;
+        b = c;
+        c = d;
+        d = t;
+    }
+    a * 1000 + b * 100 + c * 10 + d
+}
+
+fn gcd(a: int, b: int) -> int {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+fn mixed(n: int) -> int {
+    let lo = 0;
+    let hi = n;
+    let flips = 0;
+    while lo < hi {
+        if (lo + hi) % 3 == 0 {
+            let t = lo;
+            lo = hi - 1;
+            hi = t + 1;
+            if lo < hi { flips += 1; } else { lo = hi; }
+        } else {
+            lo += 1;
+        }
+    }
+    flips * 100 + lo
+}
+
+fn nested(n: int) -> int {
+    let total = 0;
+    let a = 1;
+    let b = 2;
+    for i in 0..n {
+        for j in 0..i {
+            let t = a;
+            a = b + j;
+            b = t;
+        }
+        total = total + a - b;
+    }
+    total
+}
+
+fn main() {
+    println(int_to_str(fib_iter(50)));
+    println(int_to_str(swap_n(1, 2, 0)));
+    println(int_to_str(swap_n(1, 2, 1)));
+    println(int_to_str(swap_n(1, 2, 7)));
+    println(int_to_str(rotate(1, 2, 3, 4, 0)));
+    println(int_to_str(rotate(1, 2, 3, 4, 1)));
+    println(int_to_str(rotate(1, 2, 3, 4, 6)));
+    println(int_to_str(gcd(1071, 462)));
+    println(int_to_str(mixed(20)));
+    println(int_to_str(nested(12)));
+}

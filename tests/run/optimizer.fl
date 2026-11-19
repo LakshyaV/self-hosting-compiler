@@ -1,0 +1,165 @@
+// Programs whose answers would change if an optimisation were unsound.
+
+struct Counter { n: int }
+
+fn bump(c: Counter) -> int {
+    c.n = c.n + 1;
+    c.n
+}
+
+// Constant propagation through a branch that is never taken.
+fn folded() -> int {
+    let x = 4;
+    let y = if x > 3 { x * 10 } else { bump(Counter { n: 100 }) };
+    let z = 0;
+    for i in 0..5 {
+        if y == 40 { z += 1; } else { z += 100; }
+    }
+    y + z
+}
+
+// The division is loop invariant but must not run when the loop does not.
+fn guarded_div(n: int, a: int, b: int) -> int {
+    let s = 0;
+    for i in 0..n { s = s + a / b; }
+    s
+}
+
+// Loop invariant, but only on the path where the divisor is non-zero.
+fn conditional_div(n: int, a: int, b: int) -> int {
+    let s = 0;
+    for i in 0..n {
+        if b != 0 { s = s + a / b; } else { s = s + 1; }
+    }
+    s
+}
+
+// A load that looks invariant, in a loop that writes the same field.
+fn load_store(c: Counter, n: int) -> int {
+    let s = 0;
+    for i in 0..n {
+        s = s + c.n;
+        c.n = c.n + 1;
+    }
+    s
+}
+
+// The same, with the write hidden behind a call.
+fn load_call(c: Counter, n: int) -> int {
+    let s = 0;
+    for i in 0..n {
+        s = s + c.n;
+        bump(c);
+    }
+    s
+}
+
+// Two loads of one field with a store in between must not be merged.
+fn reload(c: Counter) -> int {
+    let a = c.n;
+    c.n = a + 5;
+    let b = c.n;
+    a * 100 + b
+}
+
+// Aliasing: two names for the same object.
+fn alias(a: Counter, b: Counter) -> int {
+    a.n = 1;
+    b.n = 2;
+    a.n * 10 + b.n
+}
+
+// Common subexpressions, some of them across branches.
+fn cse(a: int, b: int) -> int {
+    let x = (a + b) * (a - b);
+    let y = (a + b) * (a - b);
+    let z = if a > b { (a + b) * 2 } else { (a + b) * 3 };
+    x + y + z + (b + a)
+}
+
+// Invariant arithmetic inside a nested loop.
+fn nested_invariant(n: int, k: int) -> int {
+    let s = 0;
+    for i in 0..n {
+        for j in 0..n {
+            s = s + (k * k + 7) * i + (k << 2) + j;
+        }
+    }
+    s
+}
+
+// A loop whose body allocates: each iteration must get a fresh object.
+fn fresh_each_time(n: int) -> int {
+    let all = vec_new();
+    for i in 0..n {
+        let c = Counter { n: 0 };
+        push(all, c);
+    }
+    for i in 0..n { at(all, i).n = i; }
+    let s = 0;
+    for i in 0..n { s = s + at(all, i).n; }
+    s
+}
+
+// Inlined callee with several returns.
+fn clamp(x: int, lo: int, hi: int) -> int {
+    if x < lo { return lo; }
+    if x > hi { return hi; }
+    x
+}
+
+fn sum_clamped(n: int) -> int {
+    let s = 0;
+    for i in 0..n { s = s + clamp(i * 7 - 20, 0, 30); }
+    s
+}
+
+// Identities the peephole rules rewrite.
+fn identities(x: int) -> int {
+    let a = x + 0;
+    let b = x * 1;
+    let c = x - x;
+    let d = x ^ x;
+    let e = x | 0;
+    let f = (x << 0) + (x >> 0);
+    let g = if x == x { 1 } else { 0 };
+    let h = if !(x < 3) { 10 } else { 20 };
+    let i = if !!(x > 3) { 100 } else { 200 };
+    a + b + c + d + e + f + g + h + i + x * 0 + (x & 0)
+}
+
+// A string's length is immutable and can be hoisted; its use cannot change.
+fn count_spaces(s: string) -> int {
+    let n = 0;
+    let i = 0;
+    while i < str_len(s) {
+        if char_at(s, i) == ' ' { n += 1; }
+        i += 1;
+    }
+    n
+}
+
+fn show(n: int) { println(int_to_str(n)); }
+
+fn main() {
+    show(folded());
+    show(guarded_div(0, 10, 0));
+    show(guarded_div(3, 10, 2));
+    show(conditional_div(4, 10, 0));
+    show(conditional_div(4, 10, 5));
+    show(load_store(Counter { n: 10 }, 4));
+    show(load_call(Counter { n: 10 }, 4));
+    show(reload(Counter { n: 3 }));
+    let shared = Counter { n: 0 };
+    show(alias(shared, shared));
+    show(alias(shared, Counter { n: 0 }));
+    show(cse(9, 4));
+    show(cse(4, 9));
+    show(nested_invariant(6, 3));
+    show(fresh_each_time(10));
+    show(sum_clamped(12));
+    show(identities(5));
+    show(identities(2));
+    show(count_spaces("the quick brown fox"));
+    show(count_spaces(""));
+}

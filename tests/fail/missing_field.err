@@ -1,0 +1,1 @@
+tests/fail/missing_field.fl:4: error: missing field 'y'
