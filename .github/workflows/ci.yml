@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Bootstrap (stage 2 must equal stage 3)
+        run: make bootstrap
+      - name: Stage 1 must equal stage 2 as well
+        run: cmp build/stage1 build/stage2
+      - name: Compiler variants reproduce stage 2
+        run: make variants
+      - name: Test suite
+        run: make test
+      - name: Checksums
+        run: sha256sum build/stage1 build/stage2 build/stage3
