@@ -1,0 +1,35 @@
+// Count lines, words and bytes in the files named on the command line.
+
+fn count(path: string) {
+    let text = read_file(path);
+    let lines = 0;
+    let words = 0;
+    let in_word = false;
+    for i in 0..str_len(text) {
+        let c = char_at(text, i);
+        if c == '\n' { lines += 1; }
+        if c == ' ' || c == '\n' || c == '\t' {
+            in_word = false;
+        } else if !in_word {
+            in_word = true;
+            words += 1;
+        }
+    }
+    let out = vec_new();
+    sb_int(out, lines);
+    sb_add(out, " ");
+    sb_int(out, words);
+    sb_add(out, " ");
+    sb_int(out, str_len(text));
+    sb_add(out, " ");
+    sb_add(out, path);
+    println(sb_str(out));
+}
+
+fn main() {
+    if arg_count() < 2 {
+        eprint("usage: wc FILE...\n");
+        exit(2);
+    }
+    for i in 1..arg_count() { count(arg(i)); }
+}

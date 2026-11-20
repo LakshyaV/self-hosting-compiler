@@ -1,0 +1,48 @@
+// Algebraic data types, pattern matching and inferred generics.
+
+type Shape = Circle(int) | Rect(int, int) | Triangle(int, int)
+
+fn area(s) {
+    match s {
+        Circle(r) => 3 * r * r,
+        Rect(w, h) => w * h,
+        Triangle(b, h) => b * h / 2
+    }
+}
+
+fn name(s) {
+    match s {
+        Circle(r) => "circle",
+        Rect(w, h) => "rectangle",
+        Triangle(b, h) => "triangle"
+    }
+}
+
+// Works for any element type and any measure; nothing here is annotated.
+fn largest(items, measure) {
+    let best = at(items, 0);
+    for i in 1..items.len {
+        if measure(at(items, i)) > measure(best) { best = at(items, i); }
+    }
+    best
+}
+
+fn main() {
+    let shapes = vec_new();
+    push(shapes, Circle(3));
+    push(shapes, Rect(4, 9));
+    push(shapes, Triangle(10, 5));
+    for i in 0..shapes.len {
+        let s = at(shapes, i);
+        println(cat3(name(s), ": ", int_to_str(area(s))));
+    }
+    println(cat3("largest: ", name(largest(shapes, area)), ""));
+
+    let words = vec_new();
+    push(words, "ssa");
+    push(words, "dominator");
+    push(words, "phi");
+    println(cat3("longest: ", largest(words, word_len), ""));
+}
+
+fn word_len(s) { str_len(s) }
